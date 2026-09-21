@@ -962,6 +962,61 @@ def main() -> int:
     mixed = plugin3._find_share_url(FakeEvent([top_card, quoted]))
     check("顶层卡片优先", mixed is not None and "cellid=top1" in mixed, str(mixed))
 
+    print("\n[21] 唤醒门禁：未 @bot 的群消息不该触发抓取")
+    # AstrBot 用 event.is_at_or_wake_command 决定要不要走 LLM 链路
+    # （process_stage/stage.py:58），默认 False。插件必须提前看这个标志，
+    # 否则群里一张没人 @bot 的卡片也会触发全量抓取+切片。
+    pw = make_plugin(main_mod, api, {})
+
+    class _Ev:
+        pass
+
+    _MISSING = object()
+
+    def ev_with(value):
+        e = _Ev()
+        if value is not _MISSING:
+            e.is_at_or_wake_command = value
+        return e
+
+    check("被 @ 时放行", pw._will_wake_bot(ev_with(True)) is True)
+    check("未被 @ 时拦截", pw._will_wake_bot(ev_with(False)) is False)
+    check("属性缺失时保守放行", pw._will_wake_bot(ev_with(_MISSING)) is True)
+    e_none = _Ev()
+    e_none.is_at_or_wake_command = None
+    check("属性为 None 时保守放行", pw._will_wake_bot(e_none) is True)
+
+    # 端到端：未被唤醒时 capture_qzone_share 必须完全不触发任何抓取
+    calls = {"build": 0, "find": 0}
+    real_build = pw._build_payload
+    real_find = pw._find_share_url
+
+    async def fake_build(event, url):
+        calls["build"] += 1
+        return ("不该被调用", [])
+
+    def fake_find(event):
+        calls["find"] += 1
+        return "https://h5.qzone.qq.com/ugc/share?res_uin=1&cellid=x"
+
+    pw._build_payload = fake_build
+    pw._find_share_url = fake_find
+    try:
+        ev_silent = ev_with(False)
+        asyncio.run(pw.capture_qzone_share(ev_silent))
+        check("未唤醒时不做任何抓取", calls["build"] == 0, str(calls))
+        check("未唤醒时连链接都不解析", calls["find"] == 0, str(calls))
+        check("未唤醒时不产生待注入内容", id(ev_silent) not in pw._pending)
+
+        calls["build"] = calls["find"] = 0
+        ev_woke = ev_with(True)
+        asyncio.run(pw.capture_qzone_share(ev_woke))
+        check("被唤醒时正常抓取", calls["build"] == 1, str(calls))
+        check("被唤醒时正常产生待注入内容", id(ev_woke) in pw._pending)
+    finally:
+        pw._build_payload = real_build
+        pw._find_share_url = real_find
+
     print("\n" + "=" * 56)
     print(f"通过 {passed} 项，失败 {len(failed)} 项")
     if failed:

@@ -71,6 +71,14 @@ class QzoneReaderPlugin(Star):
         if not self._in_scope(event):
             return
 
+        # 没被唤醒就完全不干活。
+        # 群里发一张卡片但没 @bot 时，AstrBot 的唤醒检查会拦住 LLM 请求
+        # （process_stage/stage.py:58 读的就是这个标志），bot 不会回复；
+        # 但插件原本照样抓页面、下载十几张长图、切片几十张，全部白做。
+        # 而这一步恰恰是整个插件最重的操作，必须提前挡掉。
+        if not self._will_wake_bot(event):
+            return
+
         share_url = self._find_share_url(event)
         if not share_url:
             return
@@ -80,6 +88,21 @@ class QzoneReaderPlugin(Star):
         text, images = await self._build_payload(event, share_url)
         if text:
             self._pending[id(event)] = (text, images)
+
+    @staticmethod
+    def _will_wake_bot(event: AstrMessageEvent) -> bool:
+        """这条消息是否真的会唤醒 bot（决定本轮有没有 LLM 请求）。
+
+        取 AstrBot 自己的标志位，不自己猜唤醒规则：
+        `waking_check` 阶段命中 @bot / 唤醒前缀 / 私聊直达时才置 True，
+        默认 False；`process_stage` 正是用它决定要不要走 LLM 链路。
+
+        取不到该属性时保守放行 —— 宁可多干活，也不能漏掉本该处理的分享。
+        """
+        value = getattr(event, "is_at_or_wake_command", None)
+        if value is None:
+            return True
+        return bool(value)
 
     @filter.on_llm_request()
     async def inject_qzone_content(self, event: AstrMessageEvent, req: ProviderRequest):
