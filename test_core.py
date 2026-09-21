@@ -894,6 +894,74 @@ def main() -> int:
         all(getattr(x, "_no_save", False) for x in req_o.extra_user_content_parts),
     )
 
+    print("\n[20] 群聊：先发卡片、再引用并 @bot")
+    # 真实的群聊序列：msg1 是卡片分享；msg2 引用 msg1 并 @bot，
+    # AstrBot 会把被引用消息抓回来放进 Reply.chain（get_reply 默认 True）
+    card_json = main_mod.Json(
+        {
+            "app": "com.tencent.qzone",
+            "meta": {
+                "detail_1": {
+                    "title": "看看我的说说",
+                    "desc": "今天天气不错",
+                    "qqdocurl": "https://h5.qzone.qq.com/ugc/share?res_uin=10001&cellid=quoted1",
+                }
+            },
+        }
+    )
+    quoted = main_mod.Reply(
+        id="1001",
+        chain=[card_json, main_mod.Plain(text="看看我的说说")],
+        sender_id="999",
+        sender_nickname="群友",
+        message_str="看看我的说说",
+    )
+    # 第二条消息：At(bot) + Reply(卡片)
+    class At:
+        def __init__(self, qq=""):
+            self.qq = qq
+
+    ev_quoted = FakeEvent([At(qq="3237747236"), quoted, main_mod.Plain(text=" 这瓜啥情况")])
+
+    found = plugin3._find_share_url(ev_quoted)
+    check(
+        "能从被引用消息里认出卡片链接",
+        found is not None and "cellid=quoted1" in found,
+        str(found),
+    )
+    check(
+        "字段缺失时不误报：被引用的是纯文本",
+        plugin3._find_share_url(FakeEvent([main_mod.Reply(chain=[main_mod.Plain(text="普通聊天")])]))
+        is None,
+    )
+
+    card_text = plugin3._card_text(ev_quoted)
+    check("降级文案含被引用卡片的标题", "看看我的说说" in card_text, card_text)
+    check("降级文案含用户自己说的话", "这瓜啥情况" in card_text, card_text)
+
+    # 引用里再套引用：应能递归找到，且不会无限递归
+    nested = main_mod.Reply(id="2", chain=[main_mod.Reply(id="1", chain=[card_json])])
+    nested_found = plugin3._find_share_url(FakeEvent([nested]))
+    check(
+        "嵌套引用也能找到",
+        nested_found is not None and "cellid=quoted1" in nested_found,
+        str(nested_found),
+    )
+
+    self_ref = main_mod.Reply(id="3")
+    self_ref.chain = [self_ref]  # 自引用，故意构造死循环
+    check(
+        "自引用不死循环（depth 保护）",
+        plugin3._find_share_url(FakeEvent([self_ref])) is None,
+    )
+
+    # 顶层卡片仍优先于引用内容
+    top_card = main_mod.Json(
+        {"meta": {"detail_1": {"qqdocurl": "https://h5.qzone.qq.com/ugc/share?res_uin=2&cellid=top1"}}}
+    )
+    mixed = plugin3._find_share_url(FakeEvent([top_card, quoted]))
+    check("顶层卡片优先", mixed is not None and "cellid=top1" in mixed, str(mixed))
+
     print("\n" + "=" * 56)
     print(f"通过 {passed} 项，失败 {len(failed)} 项")
     if failed:
@@ -978,6 +1046,20 @@ def load_main_module():
 
     components_mod.Plain = Plain
     components_mod.Json = Json
+
+    class Reply:
+        """桩：模拟 AstrBot 的 Reply，chain 里是被引用消息的消息链。"""
+
+        def __init__(self, id="1", chain=None, sender_id="", sender_nickname="",
+                     message_str="", **kw):
+            self.id = id
+            self.chain = chain or []
+            self.sender_id = sender_id
+            self.sender_nickname = sender_nickname
+            self.message_str = message_str
+            self.text = message_str
+
+    components_mod.Reply = Reply
     sys.modules["astrbot.core.message.components"] = components_mod
 
     # 桩：模拟 astrbot.core.agent.message 的 TextPart / ImageURLPart

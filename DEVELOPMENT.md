@@ -119,8 +119,9 @@ fetch_post(creds, share_url)
 | `_call_get_cookies(client, domain)` | 兼容 `client.call_action` 与 `client.api.call_action` 两种挂载 |
 | `_get_bot(event)` | 取协议端实例，`event.bot` 优先，回退 `context.get_platform_inst()` |
 | `_platform_ok(event)` | 手动平台门禁，只放行 `aiocqhttp` |
-| `_find_share_url(event)` | 从消息链找分享链接 |
-| `_card_text(event)` | 取卡片自带的标题/摘要，作为降级内容 |
+| `_find_share_url(event)` | 从消息链找分享链接（含被引用消息） |
+| `_scan_chain(chain, depth)` | **递归**扫描消息链，返回 `(链接, 降级文案片段)`；处理 `Reply.chain` |
+| `_card_text(event)` | 复用 `_scan_chain` 取降级文案 |
 | `_in_scope(event)` | 会话白名单判断 |
 | `_summarize_mode()` | 解析 `summarize_mode`，返回 `off` / `brief` / `full`；兼容旧键 `auto_summarize`，非法值回退 `brief` |
 | `_keep_in_context()` | 解析 `context_mode`，`keep` 返回 `True`，`once` 返回 `False` |
@@ -386,6 +387,31 @@ ImageURLPart(image_url=url)                   # ❌ ValidationError
 3. `Message._no_save` 能整条消息不落库，但那是 `Message` 层级的属性，
    而用户消息不是插件构造的，改不到。
 
+### 引用消息必须递归 `Reply.chain`
+
+群聊里「先发卡片、再引用它并 @bot」是高频用法，而被引用的内容**不在顶层消息链上**，
+只存在于 `Reply.chain` 里：
+
+```python
+# aiocqhttp_platform_adapter.py:303-339（get_reply 默认为 True）
+reply_event_data = await self.bot.call_action("get_msg", message_id=...)
+abm_reply = await self._convert_handle_message_event(new_event, get_reply=False)
+reply_seg = Reply(id=..., chain=abm_reply.message, ...)   # ← 卡片在这里
+abm.message.append(reply_seg)
+```
+
+所以 `_scan_chain()` 必须递归进 `Reply.chain`，否则群聊引用场景完全失效。
+两个实现细节：
+
+1. **`depth > 5` 保护**：`Reply.chain` 理论上可自引用，测试里专门构造了一个
+   自引用对象验证不会无限递归。
+2. **命中链接后不能提前返回**。早期版本一找到 URL 就 `return`，导致同一消息里
+   链接**之后**的文字被整段丢掉 —— 而 `@bot 这瓜啥情况` 正好在引用段之后。
+   正确做法是扫完整条链，把链接和文案分别收集。
+
+`_card_text()` 也复用 `_scan_chain()`，保证「能认出卡片」与「能取到降级文案」
+的范围一致，不出现单边失效。
+
 ## 两个必须知道的 AstrBot 陷阱
 
 这两个都是实际踩到的，改动 `main.py` 时务必保持现状。
@@ -436,7 +462,7 @@ cd astrbot_plugin_qzone_reader
 python test_core.py
 ```
 
-当前 **151 项断言**。分段：
+当前 **180 项断言**。分段：
 
 | 段 | 覆盖 |
 | --- | --- |
@@ -451,6 +477,7 @@ python test_core.py
 | `[17]` | 配置项接线（含「已移除硬上限」的断言） |
 | `[18]` | **上下文保留**：两种模式的临时标记、落历史过滤、非法值回退 |
 | `[19]` | 注入流程按 `context_mode` 分流（图片走哪个字段） |
+| `[20]` | **群聊引用卡片**：`Reply.chain` 递归、嵌套引用、自引用保护、顶层优先 |
 
 > **写测试桩时注意**：`fetch_bytes` 和 `_get_html` 都会读 `resp.status`，桩必须提供该属性。早期漏了它，导致 `status >= 400` 抛 `AttributeError` 被兜底 `except` 吞掉，表现为「图片莫名退回原 URL」——排查了好一阵。
 

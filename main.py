@@ -12,7 +12,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
-from astrbot.core.message.components import Json, Plain
+from astrbot.core.message.components import Json, Plain, Reply
 
 import aiohttp
 
@@ -377,27 +377,67 @@ class QzoneReaderPlugin(Star):
 
     # -------------------------------------------------------------- 卡片识别
 
+    @classmethod
+    def _scan_chain(cls, chain, depth: int = 0) -> tuple[str | None, list[str]]:
+        """递归扫描消息链，返回 (分享链接, 降级文案片段)。
+
+        必须递归处理 `Reply.chain`：群聊里「先发卡片、再引用它并 @bot」是常见用法，
+        而引用内容不在顶层消息链上，只在 Reply.chain 里。
+
+        `get_reply=True` 是 AstrBot 的默认行为，适配器会用 get_msg 把被引用消息
+        抓回来递归解析后放进 Reply.chain（aiocqhttp_platform_adapter.py:303-339），
+        所以被引用的卡片是可以拿到的。
+
+        注意：**找到链接后仍要扫完剩余部分**。早期版本命中就返回，导致同一消息里
+        链接之后的文字（比如用户 @bot 时说的那句）被整段丢掉。
+
+        depth 限制是为了防 Reply 嵌套自引用导致无限递归。
+
+        Returns:
+            (链接或 None, 文本片段列表)。文本片段用于读取失败时的降级文案，
+            因此只收用户自己说的话与被引用卡片的内容，不收引用消息的重复文本。
+        """
+        if depth > 5 or not chain:
+            return None, []
+
+        url: str | None = None
+        chunks: list[str] = []
+        for comp in chain or []:
+            if isinstance(comp, Json):
+                if url is None:
+                    url = extract_share_url(getattr(comp, "data", None))
+                card = extract_card_text(getattr(comp, "data", None))
+                if card and card not in chunks:
+                    chunks.append(card)
+            elif isinstance(comp, Plain):
+                text = (getattr(comp, "text", "") or "").strip()
+                if text:
+                    if url is None:
+                        # 用户可能直接粘贴链接
+                        url = extract_share_url(text)
+                    if text not in chunks:
+                        chunks.append(text)
+            elif isinstance(comp, Reply):
+                inner_url, inner_chunks = cls._scan_chain(
+                    getattr(comp, "chain", None) or [], depth + 1
+                )
+                if url is None and inner_url:
+                    url = inner_url
+                for item in inner_chunks:
+                    if item not in chunks:
+                        chunks.append(item)
+        return url, chunks
+
     def _find_share_url(self, event: AstrMessageEvent) -> str | None:
-        """从消息链里找出 QQ空间分享链接。"""
+        """从消息链（含被引用消息）里找出 QQ空间分享链接。"""
         message_obj = getattr(event, "message_obj", None)
         chain = getattr(message_obj, "message", None) or []
 
-        plain_chunks: list[str] = []
-        for comp in chain:
-            if isinstance(comp, Json):
-                url = extract_share_url(getattr(comp, "data", None))
-                if url:
-                    return url
-            elif isinstance(comp, Plain):
-                text = getattr(comp, "text", "") or ""
-                if text:
-                    plain_chunks.append(text)
-
-        # 纯文本里的链接（含用户直接粘贴的情况）
-        url = extract_share_url("\n".join(plain_chunks))
+        url, _chunks = self._scan_chain(chain)
         if url:
             return url
 
+        # 纯文本里的链接（含用户直接粘贴的情况）
         url = extract_share_url(getattr(event, "message_str", "") or "")
         if url:
             return url
@@ -407,22 +447,21 @@ class QzoneReaderPlugin(Star):
             return extract_share_url(getattr(message_obj, "raw_message", None))
         return None
 
-    @staticmethod
-    def _card_text(event: AstrMessageEvent) -> str:
-        """取卡片自带的标题/摘要与文本，作为读取失败时的降级内容。"""
+    @classmethod
+    def _card_text(cls, event: AstrMessageEvent) -> str:
+        """取卡片自带的标题/摘要与用户文本（含被引用消息），作为降级内容。
+
+        直接复用 `_scan_chain`，保证与 `_find_share_url` 的可见范围完全一致 ——
+        否则会出现「能认出被引用的卡片、却取不到它的降级文案」这种不对称。
+        """
         message_obj = getattr(event, "message_obj", None)
         chain = getattr(message_obj, "message", None) or []
-        chunks: list[str] = []
-        for comp in chain:
-            if isinstance(comp, Json):
-                card = extract_card_text(getattr(comp, "data", None))
-                if card:
-                    chunks.append(card)
-            elif isinstance(comp, Plain):
-                text = (getattr(comp, "text", "") or "").strip()
-                if text:
-                    chunks.append(text)
-        return "\n".join(chunks).strip()
+        _url, chunks = cls._scan_chain(chain)
+        if chunks:
+            return "\n".join(chunks).strip()
+
+        # 消息链里什么都没有时，退回纯文本字段
+        return (getattr(event, "message_str", "") or "").strip()
 
     def _in_scope(self, event: AstrMessageEvent) -> bool:
         whitelist = self.config.get("group_whitelist") or []
