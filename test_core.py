@@ -390,6 +390,26 @@ def main() -> int:
             check("渲染含原文配图说明", "原文配图" in rendered, rendered[-200:])
             check("渲染标注了转发关系", "转发的原内容" in rendered)
 
+            # 图片结构说明：让模型能把「正文里的 pN」和「看到的图片块」对上
+            check(
+                "转发渲染含图片结构说明",
+                "切成多个片段" in rendered,
+                "缺少 IMAGE_LAYOUT_HINT",
+            )
+            check(
+                "结构说明点明 pN 编号对应配图张数而非图片块",
+                "不是图片块序号" in rendered,
+            )
+            check(
+                "结构说明在转发场景只出现一次",
+                rendered.count("切成多个片段") == 1,
+                f"{rendered.count('切成多个片段')} 次",
+            )
+            check(
+                "不附图时不出现结构说明",
+                "切成多个片段" not in post.to_prompt(max_images=0),
+            )
+
             # 非转发不应带原文区块
             plain_cell = {
                 "cell_comm": {"time": 1700000000},
@@ -399,6 +419,17 @@ def main() -> int:
             plain = api._post_from_cell(plain_cell, url="u")
             check("普通说说不被当成转发", plain is not None and not plain.is_repost())
             check("普通说说渲染无原文区块", "转发的原内容" not in plain.to_prompt())
+
+            # 非转发的普通说说若带图，也应给出结构说明
+            plain_with_pic = dict(plain_cell)
+            plain_with_pic["cell_pic"] = {
+                "picdata": [{"photourl": {"0": {"url": "https://x/1.jpg", "width": 640, "height": 1280}}}]
+            }
+            plain2 = api._post_from_cell(plain_with_pic, url="u")
+            check(
+                "普通带图说说也有结构说明",
+                "切成多个片段" in plain2.to_prompt(max_images=2),
+            )
 
     print("\n[9] 插件组装逻辑（注入文本 + 图片裁剪）")
     main_mod = load_main_module()
@@ -417,6 +448,25 @@ def main() -> int:
         "full 不再是「先简要总结」那种聊两句的指令",
         "请先简要总结" not in full_text,
     )
+
+    # 逐图对应：用户要求总结里点明「正文哪部分 ↔ 第几张图」
+    check(
+        "full 要求指出正文与配图的对应关系",
+        "正文与配图的对应" in full_text,
+        "缺少对应关系要求",
+    )
+    check("full 要求沿用原文编号", "沿用原文的编号" in full_text)
+    for kw in ("p1", "逐条说明", "第几张图", "自行编号"):
+        check(f"full 对应关系覆盖「{kw}」", kw in full_text)
+    check(
+        "full 明确禁止只笼统说「是聊天记录」",
+        "不要只笼统说" in full_text,
+    )
+    check(
+        "旧的笼统说法已移除",
+        "说明图片内容与正文的关系" not in full_text,
+    )
+
     check(
         "三种模式长度递增",
         len(plain_text) < len(text) < len(full_text),

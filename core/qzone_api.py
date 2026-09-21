@@ -35,6 +35,16 @@ SHARE_HOST_HINTS = ("qzone.qq.com", "qzonestyle.gtimg.cn")
 # 登录态失效时接口返回的错误码
 AUTH_ERROR_CODES = {-3000, -10000, -4001}
 
+# 交代配图的结构，让模型能把「正文里的 pN」和「看到的第 N 个图片块」对上。
+# 不写这段的话，模型只会看到一串图片块，无法知道它们对应原文的第几张图。
+IMAGE_LAYOUT_HINT = (
+    "（说明：长截图会被按高度切成多个片段依次附带，"
+    "所以附带的图片块数量可能多于上面的配图张数。"
+    "片段按顺序排列，相邻片段内容有少量重叠；同一张原图切出的片段紧挨在一起。"
+    "正文里用 p1、p2 这类编号引用的「第几张图」，"
+    "对应的是上面说的配图张数顺序，不是图片块序号 —— 请按这个对应关系描述。）"
+)
+
 
 class QzoneAuthError(RuntimeError):
     """登录态失效，调用方应当作废缓存的 Cookie 并重新获取。"""
@@ -161,8 +171,9 @@ class QzonePost:
                     shown = min(len(self.original_images), max_images)
                     lines.append(
                         f"原文配图：共 {len(self.original_images)} 张，"
-                        f"已附带前 {shown} 张图片。"
+                        f"已附带前 {shown} 张。"
                     )
+                    lines.append(IMAGE_LAYOUT_HINT)
                 else:
                     lines.append(
                         f"原文配图：共 {len(self.original_images)} 张（未附带图片内容）。"
@@ -172,7 +183,9 @@ class QzonePost:
             if max_images > 0:
                 shown = min(len(self.images), max_images)
                 lines.append("")
-                lines.append(f"配图：共 {len(self.images)} 张，已附带前 {shown} 张图片。")
+                lines.append(f"配图：共 {len(self.images)} 张，已附带前 {shown} 张。")
+                if not (self.is_repost() and self.original_images):
+                    lines.append(IMAGE_LAYOUT_HINT)
             else:
                 lines.append(f"配图：共 {len(self.images)} 张（未附带图片内容）。")
 

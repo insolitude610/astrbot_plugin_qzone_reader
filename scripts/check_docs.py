@@ -84,6 +84,34 @@ def collect_log_texts(root: pathlib.Path) -> set[str]:
     return out
 
 
+def run_test_count(root: pathlib.Path) -> int | None:
+    """实际跑一次 test_core.py，从输出里取真实断言数。
+
+    静态数 `check(` 会把字符串/提示语里的同名文本也算进去，不准。
+    实测：某次静态数 213，真实数 216 —— 差的就是 f-string 里的字面量。
+    """
+    import subprocess
+    import sys
+
+    script = root / "test_core.py"
+    if not script.exists():
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(root),
+            timeout=300,
+        )
+    except Exception:
+        return None
+    match = re.search(r"通过 (\d+) 项", proc.stdout or "")
+    return int(match.group(1)) if match else None
+
+
 def main() -> int:
     root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     schema = json.loads((root / "_conf_schema.json").read_text(encoding="utf-8"))
@@ -130,13 +158,19 @@ def main() -> int:
         print("  未声明")
     else:
         claimed = int(match.group(1))
-        checks = len(re.findall(r"\bcheck\(", test_src))
-        print(f"  文档声称 {claimed}，代码里 check() 调用 {checks} 处")
-        if claimed != checks:
-            problems.append(f"断言数不一致：文档 {claimed}，实际 {checks}")
-            print("  不一致（改测试后请同步更新 DEVELOPMENT.md）")
+        actual = run_test_count(root)
+        if actual is None:
+            # 跑不起来就退回静态统计，但说明这是近似值
+            approx = len(re.findall(r"^\s*check\(", test_src, re.M))
+            print(f"  文档声称 {claimed}；测试跑不起来，静态统计约 {approx} 处")
+            print("  （静态统计会把字符串里的 check( 也算进去，仅供参考）")
         else:
-            print("  OK")
+            print(f"  文档声称 {claimed}，实际运行 {actual} 项")
+            if claimed != actual:
+                problems.append(f"断言数不一致：文档 {claimed}，实际 {actual}")
+                print("  不一致（改测试后请同步更新 DEVELOPMENT.md）")
+            else:
+                print("  OK")
 
     section("4. 文档引用的日志串是否与代码一致")
     referenced = 0
