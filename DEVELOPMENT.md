@@ -389,6 +389,37 @@ ImageURLPart(image_url=url)                   # ❌ ValidationError
 3. `Message._no_save` 能整条消息不落库，但那是 `Message` 层级的属性，
    而用户消息不是插件构造的，改不到。
 
+### `once` 模式的副作用（必须在文档里说清）
+
+过滤掉说说内容后，落库的是这样一个合法但**信息不对称**的序列：
+
+```
+user      |（转发卡片）              ← 卡片本身，不含正文
+assistant | 我看完了，这瓜讲的是…    ← bot 自己的总结
+```
+
+bot 记得自己总结过，却看不到依据。直接追问会得到含糊回答 —— 这不是 bug，
+是 `once` 定义如此，但用户不被告知就会以为是插件坏了。
+
+**可访问性没有损失**：引用那条卡片 + @bot 会重新解析并重新抓取，走的是
+QQ 服务器上的原消息，与会话历史无关。所以 `once` 省的只是上下文额度。
+
+### 关于「是否破坏缓存」
+
+结论：**不破坏**。
+
+- AstrBot 的会话历史不是常驻内存缓存，而是每次请求 `get_conversation_by_id`
+  从库读取、写完 `update_conversation` 整体覆盖（`conversation_mgr.py`）。
+  `once` 只是让落库的副本少了说说内容。
+- `keep` / `once` 产出的都是合法的 user/assistant 交替结构，不会导致上下文
+  错乱或 provider 报错。
+- AstrBot 确有 provider 侧 prompt 缓存（Anthropic 的 `cache_control: ephemeral`、
+  Gemini 的 `cached_content_token_count`），但那属于服务端前缀缓存：
+  历史变短只会让缓存前缀一次性失效并重建，不会产生错误。
+
+曾考虑在文档里写「会影响 prompt 缓存」的警告，核对后判定为**不成立**，
+故未写入 —— 不做没有依据的免责声明。
+
 ### 引用消息必须递归 `Reply.chain`
 
 群聊里「先发卡片、再引用它并 @bot」是高频用法，而被引用的内容**不在顶层消息链上**，
