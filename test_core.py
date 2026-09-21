@@ -79,7 +79,8 @@ def load_module():
     core_pkg.__path__ = [str(PLUGIN_DIR / "core")]  # type: ignore[attr-defined]
     sys.modules[f"{PKG_NAME}.core"] = core_pkg
 
-    # qzone_api 会 `from . import frontpage`，先把同包模块挂上
+    # qzone_api 会 `from . import frontpage`，main 会 `from .core import images`，
+    # 先把同包模块挂上
     fp_spec = importlib.util.spec_from_file_location(
         f"{PKG_NAME}.core.frontpage", PLUGIN_DIR / "core" / "frontpage.py"
     )
@@ -88,6 +89,14 @@ def load_module():
     setattr(core_pkg, "frontpage", fp_module)
     fp_spec.loader.exec_module(fp_module)
 
+    img_spec = importlib.util.spec_from_file_location(
+        f"{PKG_NAME}.core.images", PLUGIN_DIR / "core" / "images.py"
+    )
+    img_module = importlib.util.module_from_spec(img_spec)
+    sys.modules[img_spec.name] = img_module
+    setattr(core_pkg, "images", img_module)
+    img_spec.loader.exec_module(img_module)
+
     spec = importlib.util.spec_from_file_location(
         f"{PKG_NAME}.core.qzone_api", PLUGIN_DIR / "core" / "qzone_api.py"
     )
@@ -95,6 +104,7 @@ def load_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     module.frontpage = fp_module
+    module.images = img_module
     return module
 
 
@@ -661,6 +671,138 @@ def main() -> int:
 
     check("普通异常不重取登录态", calls2["creds"] == 0, str(calls2))
     check("普通异常返回 None（走降级）", result2 is None)
+
+    print("\n[16] 长截图切片（瓜条配图读不出文字的根因）")
+    iu = api.images
+    try:
+        from PIL import Image as _PILImage
+
+        has_pil = True
+    except Exception:  # noqa: BLE001
+        _PILImage = None
+        has_pil = False
+    check("Pillow 可用（切片依赖）", has_pil)
+
+    if has_pil:
+        import base64 as _b64
+        import io as _io
+
+        def make_image(w, h, fmt="JPEG", quality=85):
+            im = _PILImage.new("RGB", (w, h), (255, 255, 255))
+            # 画一些横线，模拟聊天文字行
+            for y in range(0, h, 50):
+                for x in range(8, max(w - 8, 9), 3):
+                    im.putpixel((x, y), (20, 20, 20))
+            buf = _io.BytesIO()
+            im.save(buf, format=fmt, quality=quality)
+            return buf.getvalue()
+
+        def decode_size(data_url):
+            raw = _b64.b64decode(data_url.split(",", 1)[1])
+            with _PILImage.open(_io.BytesIO(raw)) as s:
+                return s.size
+
+        check("长截图判定：640x3799", iu.is_tall(640, 3799) is True)
+        check("长截图判定：476x4096", iu.is_tall(476, 4096) is True)
+        check("普通图判定：1200x900", iu.is_tall(1200, 900) is False)
+        # 1400x1700：高度过阈值，但宽高比 1.21 未到 1.5，属于正常竖图，不该切
+        check("竖图但宽高比不足不切：1400x1700", iu.is_tall(1400, 1700) is False)
+        check("刚过阈值的高瘦图要切：640x1600", iu.is_tall(640, 1600) is True)
+
+        tall = make_image(640, 3799)
+        pieces = iu.slice_image(tall)
+        check("真实尺寸长图被切片", len(pieces) >= 3, f"{len(pieces)} 片")
+        check("切片是 data URL", all(p.startswith("data:image/jpeg;base64,") for p in pieces))
+        sizes = [decode_size(p) for p in pieces]
+        check("切片保持原宽度", all(w == 640 for w, _ in sizes), str(sizes))
+        check("每片高度不超过目标", all(h <= iu.DEFAULT_SLICE_HEIGHT for _, h in sizes), str(sizes))
+        check(
+            "切片能覆盖整图高度（含重叠）",
+            sum(h for _, h in sizes) >= 3799,
+            f"合计 {sum(h for _, h in sizes)}",
+        )
+        check("切片不重叠丢失：末片到底部", sizes[-1][1] <= iu.DEFAULT_SLICE_HEIGHT)
+
+        normal = make_image(1200, 900)
+        check("普通图不切片", iu.slice_image(normal) == [])
+
+        extreme = make_image(600, 12000, quality=60)
+        extreme_pieces = iu.slice_image(extreme)
+        check(
+            "极端长图受单图片数上限约束",
+            len(extreme_pieces) <= iu.MAX_SLICES_PER_IMAGE,
+            f"{len(extreme_pieces)} 片",
+        )
+
+        check("损坏数据返回空列表（不抛错）", iu.slice_image(b"not an image") == [])
+        check("空数据返回空列表", iu.slice_image(b"") == [])
+
+        # prepare_images：预算与切片的关系
+        class _Resp:
+            def __init__(self, body):
+                self._body = body
+                self.status = 200  # fetch_bytes 会读 status，桩必须提供
+
+            async def read(self):
+                return self._body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *e):
+                return False
+
+        class _Session:
+            def __init__(self, body):
+                self._body = body
+                self.calls = 0
+
+            def get(self, url, **kw):
+                self.calls += 1
+                return _Resp(self._body)
+
+        sess = _Session(tall)
+        out = asyncio.run(
+            iu.prepare_images(sess, ["http://x/1.jpg"], budget=4, slice_tall=True)
+        )
+        check("预算限制生效：最多 4 张", len(out) <= 4, f"{len(out)} 张")
+        check("切片占用了预算额度", 1 < len(out) <= 4, f"{len(out)} 张")
+
+        sess2 = _Session(tall)
+        out2 = asyncio.run(
+            iu.prepare_images(sess2, ["http://x/1.jpg"], budget=0, slice_tall=True)
+        )
+        check("预算为 0 返回空", out2 == [])
+
+        sess3 = _Session(normal)
+        out3 = asyncio.run(
+            iu.prepare_images(sess3, ["http://x/n.jpg"], budget=4, slice_tall=True)
+        )
+        check("普通图原样返回 URL", out3 == ["http://x/n.jpg"], str(out3))
+
+        sess4 = _Session(b"broken")
+        out4 = asyncio.run(
+            iu.prepare_images(sess4, ["http://x/b.jpg"], budget=4, slice_tall=True)
+        )
+        check("坏图退回原 URL 而不是丢弃", out4 == ["http://x/b.jpg"], str(out4))
+
+        sess5 = _Session(tall)
+        out5 = asyncio.run(
+            iu.prepare_images(sess5, ["http://x/1.jpg"], budget=4, slice_tall=False)
+        )
+        check("关闭切片时直接给原 URL", out5 == ["http://x/1.jpg"], str(out5))
+
+    print("\n[17] 配置项接线")
+    p = make_plugin(main_mod, api, {})
+    check("默认开启长图切片", bool(p.config.get("slice_tall_images", True)) is True)
+    check(
+        "切片高度留 0 时回退默认值",
+        (lambda v: (v if v > 0 else api.images.DEFAULT_SLICE_HEIGHT))(
+            int(p.config.get("slice_max_height", 0) or 0)
+        )
+        == api.images.DEFAULT_SLICE_HEIGHT,
+    )
+    check("已移除隐藏硬上限 HARD_IMAGE_CAP", not hasattr(main_mod, "HARD_IMAGE_CAP"))
 
     print("\n" + "=" * 56)
     print(f"通过 {passed} 项，失败 {len(failed)} 项")

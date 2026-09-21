@@ -36,6 +36,7 @@ astrbot_plugin_qzone_reader/
 ├── core/
 │   ├── __init__.py            # 包说明
 │   ├── frontpage.py           # 解析 h5 分享页内嵌的 FrontPage 数据
+│   ├── images.py              # 长截图切片与配图预算控制
 │   └── qzone_api.py           # 数据模型、链接识别、HTTP 调用、降级逻辑
 ├── tests/fixtures/
 │   └── repost_cell.json       # 脱敏后的转发说说数据，供回归测试用
@@ -48,11 +49,13 @@ astrbot_plugin_qzone_reader/
 
 | 模块 | 负责 | 不负责 |
 | --- | --- | --- |
-| `main.py` | AstrBot 交互、事件过滤、登录态来源、注入、降级决策 | 任何 HTML/JSON 解析 |
-| `core/qzone_api.py` | 链接识别、参数提取、HTTP、降级编排、渲染成文本 | AstrBot 相关逻辑 |
+| `main.py` | AstrBot 交互、事件过滤、登录态来源、注入、降级决策、配图预算 | 任何 HTML/JSON 解析、图片编解码 |
+| `core/qzone_api.py` | 链接识别、参数提取、HTTP、降级编排、渲染成文本 | AstrBot 相关逻辑、图片处理 |
 | `core/frontpage.py` | 纯函数：从 HTML 里解出说说数据结构 | 网络、AstrBot |
+| `core/images.py` | 图片下载、长截图切片、按预算挑选 | 业务判断、AstrBot |
 
 `core/frontpage.py` 刻意做成**零依赖纯函数模块**，可以脱离整个插件单独测试。
+`core/images.py` 是唯一依赖 Pillow 的模块，且**延迟导入**：缺库时只降级为发原图，不影响插件加载。
 
 ## 数据流
 
@@ -127,10 +130,13 @@ fetch_post(creds, share_url)
 
 | 常量 | 说明 |
 | --- | --- |
-| `HARD_IMAGE_CAP = 9` | 图片数硬上限，防止上下文被撑爆 |
 | `BRIEF_SUMMARY_INSTRUCTION` | `summarize_mode=brief` 的指令：要点式总结后自然接话 |
 | `FULL_SUMMARY_INSTRUCTION` | `summarize_mode=full` 的指令：以完整总结为主体，6 条要点清单 |
 | `FAILURE_HINT` | 读取失败时给模型的提示，明确要求「不要编造」 |
+
+> **图片数量没有硬上限。** 早期版本有一个值为 `9` 的图片硬上限常量（现已删除），
+> 导致用户把 `max_images` 调到 14 却只发 9 张、且没有任何提示。现在 `max_images`
+> 是唯一上限，切片也计入其中。`test_core.py` 的 `[17]` 段有一条断言守着这个常量不会被加回来。
 
 ### 总结模式与指令
 
@@ -221,6 +227,28 @@ fetch_post(creds, share_url)
 - `_frontpage_object_starts(source)` — 找 `FrontPage = {` 的位置，排除 `xxxFrontPage` 这类更长标识符
 - `_balanced_object(source, start)` — 按括号配平切出对象，正确跳过字符串转义与 `//`、`/* */` 注释
 - `_extract_top_level_value(outer, key)` — 在对象第一层取 `key: {...}`
+
+### `core/images.py`
+
+唯一依赖 Pillow 的模块，且延迟导入。
+
+| 函数 | 说明 |
+| --- | --- |
+| `is_tall(width, height, threshold)` | 是否算长截图：`height >= threshold` 且 `height > width * 1.5` |
+| `slice_image(data, slice_height, overlap, max_slices)` | 切成长图 data URL 列表；不需切或失败返回 `[]` |
+| `fetch_bytes(session, url, headers, timeout)` | 下载图片字节，失败返回 `None` |
+| `prepare_images(session, urls, budget, ...)` | 按预算挑选图片，长图切片、其余原样 |
+
+常量：`DEFAULT_TALL_THRESHOLD=1600`、`DEFAULT_SLICE_HEIGHT=1280`、`DEFAULT_OVERLAP=80`、`MAX_SLICES_PER_IMAGE=12`、`JPEG_QUALITY=88`。
+
+设计要点：
+
+- **保持宽度不变**。文字清晰度取决于宽度，等比缩放才是导致长截图糊掉的元凶，所以只切高度。
+- **片间留 `DEFAULT_OVERLAP=80` 像素重叠**，避免把一条聊天消息拦腰截断。
+- 切片输出为 **data URL**（`data:image/jpeg;base64,...`）。已验证 AstrBot 的 `MediaResolver` 支持 data URI（`media_utils.py` 的 `startswith("data:")` 分支），因此不必二次下载，也自带内容不依赖网络。
+- `PIL` 的 CPU 操作走 `asyncio.to_thread()`，不阻塞事件循环。
+- 任何一步失败都**退回原 URL 而不是丢弃图片**，保证降级路径不会让内容变少。
+- `budget`（即 `max_images`）是**最终张数上限**，切片计入其中。这是防止一本 14 张长图的瓜条被切成 50+ 片的关键。
 
 ## FrontPage 数据结构
 
@@ -361,7 +389,7 @@ cd astrbot_plugin_qzone_reader
 python test_core.py
 ```
 
-当前 **111 项断言**。分段：
+当前 **151 项断言**。分段：
 
 | 段 | 覆盖 |
 | --- | --- |
@@ -372,6 +400,10 @@ python test_core.py
 | `[8d]` | **转发：必须读到原文**，且不重复渲染 |
 | `[9]`–`[13]` | 插件组装、白名单、卡片识别、转义还原、平台门禁 |
 | `[14]`–`[15]` | 登录态失效检测与自动重取 |
+| `[16]` | **长截图切片**：尺寸判定、切片尺寸、预算约束、降级路径 |
+| `[17]` | 配置项接线（含「已移除硬上限」的断言） |
+
+> **写测试桩时注意**：`fetch_bytes` 和 `_get_html` 都会读 `resp.status`，桩必须提供该属性。早期漏了它，导致 `status >= 400` 抛 `AttributeError` 被兜底 `except` 吞掉，表现为「图片莫名退回原 URL」——排查了好一阵。
 
 ### fixture
 
@@ -470,3 +502,5 @@ print(cell.keys() if cell else "解析失败")
 | `id(event)` 作暂存键 | 极端情况下未走到 LLM 请求的消息会残留一条暂存 |
 | 分享页可能返回登录页 | 此时 `FrontPage` 仍在但 `data` 为空，会落到列表接口兜底 |
 | 视频 | 只记录数量，未解析。`cell_video()` 已能取地址，但未接入注入 |
+| 切片参数为经验值 | `DEFAULT_SLICE_HEIGHT=1280`、`is_tall` 的 1.5 倍判据都基于常见视觉模型的缩放行为，未针对具体模型实测校准。不同模型的上限不同，必要时可用 `slice_max_height` 调整 |
+| 切片不计内容边界 | 按固定像素切，重叠 80px 只能降低切断风险，无法保证不切断一条消息 |

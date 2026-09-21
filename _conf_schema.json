@@ -25,10 +25,22 @@
     "default": true
   },
   "max_images": {
-    "description": "最多附带图片数",
+    "description": "配图数量上限",
     "type": "int",
-    "hint": "把说说配图交给多模态模型阅读。设为 0 表示不附带图片（适用于纯文本模型）。",
+    "hint": "最终交给模型的图片总数上限（切片计入其中）。设为 0 表示不带图。无隐藏上限，但张数越多 token 消耗越大。",
     "default": 4
+  },
+  "slice_tall_images": {
+    "description": "长截图切片",
+    "type": "bool",
+    "hint": "QQ空间瓜条配图常是聊天记录长截图（如 640x3799）。直接发送会被视觉模型缩放到像素上限，文字糊掉读不出内容。开启后会保持宽度、按高度切成多段再发送，模型才能真正读到图里的细节。代价：图片张数变多、token 上涨，且受「配图数量上限」约束。",
+    "default": true
+  },
+  "slice_max_height": {
+    "description": "切片高度",
+    "type": "int",
+    "hint": "每片的目标最大高度（像素），仅在上方切片开启时生效。留 0 使用默认值 1280。调小可提高清晰度但会增加片数。",
+    "default": 0
   },
   "summarize_mode": {
     "description": "总结模式",

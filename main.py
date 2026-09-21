@@ -14,6 +14,9 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.message.components import Json, Plain
 
+import aiohttp
+
+from .core import images as image_utils
 from .core.qzone_api import (
     CookieCache,
     QzoneAuthError,
@@ -24,9 +27,7 @@ from .core.qzone_api import (
     fetch_post,
 )
 
-# 一次注入里附带的图片上限，防止把模型上下文撑爆
-HARD_IMAGE_CAP = 9
-
+# 统一保留：一次注入里的图片总数上限由 max_images 决定，不再有隐藏硬上限。
 # summarize_mode = brief：要点式总结后自然接话（默认，最省）
 BRIEF_SUMMARY_INSTRUCTION = (
     "用户转发了一条 QQ空间说说，上面的【QQ空间说说原文】就是该说说的内容。\n"
@@ -112,9 +113,12 @@ class QzoneReaderPlugin(Star):
         notify = bool(self.config.get("notify_on_failure", True))
 
         post = None
+        # QQ空间图床要 Referer，下载配图时复用登录态请求头
+        creds_headers: dict[str, str] = {}
         if self.config.get("read_full_feed", True):
             creds = await self._get_credentials(event)
             if creds is not None:
+                creds_headers = creds.headers()
                 post = await self._fetch_with_retry(event, creds, share_url)
             else:
                 logger.warning("[qzone_reader] 没有可用的 QQ空间登录态")
@@ -138,17 +142,55 @@ class QzoneReaderPlugin(Star):
             return FAILURE_HINT, []
 
         # 转发场景下原文配图才是主体，优先附上，剩余额度再给外层配图
-        images: list[str] = []
-        if max_images > 0:
-            cap = min(max_images, HARD_IMAGE_CAP)
-            for url in [*post.original_images, *post.images]:
-                if url not in images:
-                    images.append(url)
-                if len(images) >= cap:
-                    break
+        candidates: list[str] = []
+        for url in [*post.original_images, *post.images]:
+            if url not in candidates:
+                candidates.append(url)
+
+        images = await self._prepare_images(event, candidates, max_images, creds_headers)
 
         body = post.to_prompt(max_images=len(images))
         return self._with_instruction(body, mode), images
+
+    async def _prepare_images(
+        self,
+        event: AstrMessageEvent,
+        candidates: list[str],
+        budget: int,
+        headers: dict[str, str],
+    ) -> list[str]:
+        """按预算准备配图，长截图会切片后再给模型。
+
+        budget 是最终图片总数上限，切片计入其中 —— 否则一本瓜条的十余张
+        长图能切成几十片，token 会失控。
+        """
+        if budget <= 0 or not candidates:
+            return []
+        slice_tall = bool(self.config.get("slice_tall_images", True))
+        if not slice_tall:
+            return candidates[:budget]
+
+        try:
+            slice_height = int(self.config.get("slice_max_height", 0) or 0)
+        except (TypeError, ValueError):
+            slice_height = 0
+        if slice_height <= 0:
+            slice_height = image_utils.DEFAULT_SLICE_HEIGHT
+
+        timeout = aiohttp.ClientTimeout(total=30)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                return await image_utils.prepare_images(
+                    session,
+                    candidates,
+                    budget=budget,
+                    headers=headers,
+                    slice_tall=True,
+                    slice_height=slice_height,
+                )
+        except Exception as exc:  # noqa: BLE001 - 图片处理失败不该打断对话
+            logger.warning("[qzone_reader] 配图处理失败，退回原始地址: %s", exc)
+            return candidates[:budget]
 
     async def _fetch_with_retry(
         self, event: AstrMessageEvent, creds: QzoneCredentials, share_url: str
