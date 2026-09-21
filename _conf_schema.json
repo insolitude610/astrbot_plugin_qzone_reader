@@ -1,0 +1,51 @@
+{
+  "cookie_source": {
+    "description": "登录态来源",
+    "type": "string",
+    "hint": "napcat 表示通过 OneBot 协议端自动获取 QQ空间 Cookie（推荐，NapCat 支持）；manual 表示只使用下方手动填写的 Cookie。",
+    "options": ["napcat", "manual"],
+    "default": "napcat"
+  },
+  "cookies_str": {
+    "description": "手动 Cookie（可选）",
+    "type": "string",
+    "hint": "当 cookie_source=manual，或自动获取失败时的兜底。浏览器登录 QQ空间 后 F12 -> Network 复制完整 Cookie，需包含 uin、skey、p_skey。",
+    "default": ""
+  },
+  "cookie_ttl": {
+    "description": "Cookie 缓存秒数",
+    "type": "int",
+    "hint": "从协议端获取的 Cookie 在本地的缓存时长，避免每条消息都请求一次。设为 0 表示不缓存。",
+    "default": 600
+  },
+  "read_full_feed": {
+    "description": "读取完整说说正文",
+    "type": "bool",
+    "hint": "开启后会用接口拉取该条说说的完整正文与全部图片；关闭则只使用卡片上自带的标题和摘要。",
+    "default": true
+  },
+  "max_images": {
+    "description": "最多附带图片数",
+    "type": "int",
+    "hint": "把说说配图交给多模态模型阅读。设为 0 表示不附带图片（适用于纯文本模型）。",
+    "default": 4
+  },
+  "auto_summarize": {
+    "description": "转发后自动总结",
+    "type": "bool",
+    "hint": "开启后会在注入内容里附加一段总结指令，bot 收到转发即自动总结；关闭则只注入原文，等你提问。",
+    "default": true
+  },
+  "group_whitelist": {
+    "description": "生效会话白名单",
+    "type": "list",
+    "hint": "填写会话 ID（群号或用户 QQ）。留空表示所有会话都生效。",
+    "default": []
+  },
+  "notify_on_failure": {
+    "description": "失败时提示",
+    "type": "bool",
+    "hint": "登录态失效或解析失败时，在会话里回一条简短提示。",
+    "default": true
+  }
+}

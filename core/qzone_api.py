@@ -1,0 +1,511 @@
+"""QQ空间 Web 接口访问层。
+
+只做最小可用的事情：拿着登录态 Cookie 去查一条说说的完整内容。
+接口与参数沿用 QQ空间 Web 端一直在用的那套 cgi，属于社区长期验证过的用法。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from html import unescape
+from http.cookies import SimpleCookie
+from time import monotonic
+from typing import Any
+from urllib.parse import urlsplit
+
+import aiohttp
+from astrbot.api import logger
+
+# 说说列表 / 单条详情接口
+LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
+DETAIL_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msgdetail_v6"
+
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+)
+
+# 分享链接里可能出现的域名，用于从任意卡片 JSON 中捞出真正的说说地址
+SHARE_HOST_HINTS = ("qzone.qq.com", "qzonestyle.gtimg.cn")
+
+# 登录态失效时接口返回的错误码
+AUTH_ERROR_CODES = {-3000, -10000, -4001}
+
+
+class QzoneAuthError(RuntimeError):
+    """登录态失效，调用方应当作废缓存的 Cookie 并重新获取。"""
+
+
+@dataclass
+class QzoneCredentials:
+    """一条可用的 QQ空间登录态。"""
+
+    uin: int
+    skey: str = ""
+    p_skey: str = ""
+    source: str = ""
+
+    @property
+    def gtk(self) -> str:
+        """由 p_skey 推导出接口需要的 g_tk 令牌。"""
+        hash_val = 5381
+        for ch in self.p_skey:
+            hash_val += (hash_val << 5) + ord(ch)
+        return str(hash_val & 0x7FFFFFFF)
+
+    def cookie_header(self) -> str:
+        parts = [f"uin=o{self.uin}", f"skey={self.skey}"]
+        if self.p_skey:
+            parts.append(f"p_skey={self.p_skey}")
+        return "; ".join(parts)
+
+    def headers(self, referer: str | None = None) -> dict[str, str]:
+        return {
+            "User-Agent": BROWSER_UA,
+            "Referer": referer or f"https://user.qzone.qq.com/{self.uin}",
+            "Origin": "https://user.qzone.qq.com",
+            "Cookie": self.cookie_header(),
+        }
+
+
+@dataclass
+class QzonePost:
+    """一条说说的可读内容。"""
+
+    uin: int = 0
+    name: str = ""
+    text: str = ""
+    rt_text: str = ""
+    images: list[str] = field(default_factory=list)
+    videos: list[str] = field(default_factory=list)
+    created_time: int = 0
+    comment_count: int = 0
+    like_count: int = 0
+    source_name: str = ""
+    location: str = ""
+    url: str = ""
+
+    def is_empty(self) -> bool:
+        return not (self.text.strip() or self.rt_text.strip() or self.images or self.videos)
+
+    def to_prompt(self, *, max_images: int = 0) -> str:
+        """渲染成一段给模型看的纯文本。"""
+        lines: list[str] = ["【QQ空间说说原文】"]
+        if self.name:
+            lines.append(f"作者：{self.name}" + (f"（QQ {self.uin}）" if self.uin else ""))
+        if self.created_time:
+            lines.append(f"发布时间：{format_time(self.created_time)}")
+        if self.source_name:
+            lines.append(f"来源：{self.source_name}")
+        if self.location:
+            lines.append(f"定位：{self.location}")
+
+        body = self.text.strip()
+        if not body:
+            body = "（这条说说没有文字内容）"
+        lines.append("")
+        lines.append("正文：")
+        lines.append(body)
+
+        if self.rt_text.strip():
+            lines.append("")
+            lines.append("转发/引用内容：")
+            lines.append(self.rt_text.strip())
+
+        if self.images:
+            if max_images > 0:
+                shown = min(len(self.images), max_images)
+                lines.append("")
+                lines.append(f"配图：共 {len(self.images)} 张，已附带前 {shown} 张图片。")
+            else:
+                lines.append(f"配图：共 {len(self.images)} 张（未附带图片内容）。")
+
+        if self.videos:
+            lines.append(f"含视频：{len(self.videos)} 个（视频内容未解析）。")
+
+        if self.comment_count or self.like_count:
+            lines.append(f"互动：{self.like_count} 赞 / {self.comment_count} 评论")
+
+        if self.url:
+            lines.append("")
+            lines.append(f"原始链接：{self.url}")
+        return "\n".join(lines)
+
+
+def format_time(ts: int) -> str:
+    """把秒级时间戳格式化成本地时间字符串。"""
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OSError, OverflowError):
+        return str(ts)
+
+
+def _looks_like_share(url: str) -> bool:
+    return "/ugc/share" in url or "mobile.qzone.qq.com/l" in url
+
+
+def extract_share_url(payload: Any) -> str | None:
+    """从卡片 JSON 或纯文本里找出 QQ空间说说地址。
+
+    只说说的分享卡片结构在不同 QQ 版本里并不统一，
+    所以这里不假设字段名：递归扫描所有字符串，
+    并把形如「看看这个 https://... 很有意思」的文本也一起处理。
+    """
+    candidates: list[str] = []
+    for raw in _walk_strings(payload):
+        # QQ 卡片会把逗号转义成 &#44;，先还原，否则 query 参数会被截断
+        candidates.extend(_URL_RE.findall(unescape(raw)))
+
+    best: str | None = None
+    for url in candidates:
+        url = url.strip().rstrip("，。；！？）】》」』、,.;!?)]}>\"'")
+        if not any(hint in url for hint in SHARE_HOST_HINTS):
+            continue
+        # 优先选真正指向某条说说的分享链接
+        if _looks_like_share(url):
+            return url
+        if best is None:
+            best = url
+    return best
+
+
+_URL_RE = re.compile(r"https?://[^\s<>\"'，。；！？）】》」』]+", re.IGNORECASE)
+
+# 卡片里可能承载文案的字段名，按可读性排序
+_CARD_TEXT_KEYS = ("title", "desc", "description", "summary", "content", "text", "nickname")
+
+
+def extract_card_text(payload: Any, *, limit: int = 300) -> str:
+    """从卡片 JSON 里取出标题/摘要，作为读不到正文时的降级内容。"""
+    found: dict[str, str] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (
+                    key in _CARD_TEXT_KEYS
+                    and isinstance(value, str)
+                    and value.strip()
+                    and len(value.strip()) < 500
+                ):
+                    found.setdefault(key, value.strip())
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload)
+    parts: list[str] = []
+    for key in _CARD_TEXT_KEYS:
+        value = found.get(key)
+        if value and value not in parts:
+            parts.append(value)
+    text = "\n".join(parts).strip()
+    return text[:limit]
+
+
+def _walk_strings(node: Any):
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _walk_strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk_strings(value)
+
+
+def parse_share_url(url: str) -> dict[str, str]:
+    """拆出分享链接的 query 参数（uin / cellid / 时间戳等）。
+
+    QQ空间分享链接的参数分隔符既可能是 `&`，也可能是被转义还原后的 `,`，
+    这里两种都按分隔符处理。
+    """
+    try:
+        query = urlsplit(url).query
+    except ValueError:
+        return {}
+    result: dict[str, str] = {}
+    for chunk in re.split(r"[&,]", query):
+        if "=" not in chunk:
+            continue
+        key, _, value = chunk.partition("=")
+        key = key.strip()
+        if key and key not in result:
+            result[key] = value.strip()
+    return result
+
+
+def credentials_from_cookie_string(cookie_str: str, source: str = "manual") -> QzoneCredentials | None:
+    """从 Cookie 字符串里解析出 uin / skey / p_skey。"""
+    text = (cookie_str or "").strip()
+    if not text:
+        return None
+    try:
+        jar = {k: v.value for k, v in SimpleCookie(text).items()}
+    except Exception:  # noqa: BLE001 - Cookie 格式千奇百怪，解析失败就当没有
+        return None
+    if not jar:
+        return None
+
+    uin_text = jar.get("uin") or jar.get("p_uin") or ""
+    uin_raw = uin_text[1:] if uin_text[:1].lower() == "o" else uin_text
+    uin = int(uin_raw) if uin_raw.isdigit() else 0
+    if not uin:
+        return None
+
+    p_skey = jar.get("p_skey") or jar.get("skey") or ""
+    if not p_skey:
+        return None
+    return QzoneCredentials(uin=uin, skey=jar.get("skey", ""), p_skey=p_skey, source=source)
+
+
+async def fetch_post(
+    creds: QzoneCredentials,
+    share_url: str,
+    *,
+    timeout: int = 20,
+) -> QzonePost | None:
+    """按分享链接拉取该条说说的完整内容。"""
+    params = parse_share_url(share_url)
+    # res_uin 是分享页标注的内容所属账号；没有就退回用自己看得见的动态去匹配
+    host_uin = params.get("res_uin") or params.get("uin") or str(creds.uin)
+    host_uin = host_uin.lstrip("o") if host_uin[:1].lower() == "o" else host_uin
+    if not host_uin.isdigit():
+        host_uin = str(creds.uin)
+    cell_id = params.get("cellid") or ""
+
+    conn_timeout = aiohttp.ClientTimeout(total=timeout)
+    async with aiohttp.ClientSession(timeout=conn_timeout) as session:
+        msglist, error = await _fetch_msglist(session, creds, int(host_uin))
+        if error in AUTH_ERROR_CODES:
+            raise QzoneAuthError(f"QQ空间登录态失效（code={error}）")
+        if not msglist:
+            return None
+
+        picked = _pick_feed(msglist, cell_id=cell_id, share_url=share_url)
+        if picked is None:
+            return None
+
+        post = _post_from_feed(picked, share_url=share_url)
+
+        # 列表接口的正文可能被截断，命中后用详情接口拿全文
+        tid = str(picked.get("tid") or "")
+        if tid:
+            detail = await _fetch_detail(session, creds, int(host_uin), tid)
+            if detail:
+                post = _post_from_feed(detail, share_url=share_url, base=post)
+        return post
+
+
+async def _fetch_msglist(
+    session: aiohttp.ClientSession,
+    creds: QzoneCredentials,
+    host_uin: int,
+    *,
+    num: int = 20,
+) -> tuple[list[dict], int | None]:
+    """返回 (动态列表, 接口错误码)。"""
+    params = {
+        "uin": str(host_uin),
+        "ftype": "0",
+        "sort": "0",
+        "pos": "0",
+        "num": str(num),
+        "replynum": "0",
+        "g_tk": creds.gtk,
+        "callback": "_preloadCallback",
+        "code_version": "1",
+        "format": "jsonp",
+        "need_comment": "0",
+        "need_private_comment": "1",
+    }
+    text = await _get_text(session, LIST_URL, creds, params)
+    payload = _loads_jsonp(text)
+    if not isinstance(payload, dict):
+        return [], None
+    error = payload.get("code")
+    msglist = payload.get("msglist")
+    if isinstance(msglist, list):
+        return [item for item in msglist if isinstance(item, dict)], error if isinstance(error, int) else None
+    return [], error if isinstance(error, int) else None
+
+
+async def _fetch_detail(
+    session: aiohttp.ClientSession,
+    creds: QzoneCredentials,
+    host_uin: int,
+    tid: str,
+) -> dict | None:
+    params = {
+        "uin": str(host_uin),
+        "tid": tid,
+        "format": "jsonp",
+        "g_tk": creds.gtk,
+    }
+    text = await _get_text(session, DETAIL_URL, creds, params)
+    payload = _loads_jsonp(text)
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        return payload["data"]
+    return None
+
+
+async def _get_text(
+    session: aiohttp.ClientSession,
+    url: str,
+    creds: QzoneCredentials,
+    params: dict[str, str],
+) -> str:
+    try:
+        async with session.get(url, params=params, headers=creds.headers()) as resp:
+            if resp.status >= 400:
+                logger.warning("[qzone_reader] 接口返回 HTTP %s: %s", resp.status, url)
+                return ""
+            raw = await resp.read()
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        logger.warning("[qzone_reader] 请求 QQ空间接口失败: %s", exc)
+        return ""
+    # QQ空间接口有时返回 GBK
+    for encoding in ("utf-8", "gbk", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _loads_jsonp(text: str) -> Any:
+    """把 jsonp 回调包成真正的 JSON 再解析。"""
+    body = (text or "").strip()
+    if not body:
+        return None
+    if body.startswith("{"):
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return None
+
+    start = body.find("(")
+    end = body.rfind(")")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(body[start + 1 : end])
+    except json.JSONDecodeError:
+        return None
+
+
+def _pick_feed(
+    msglist: list[dict],
+    *,
+    cell_id: str,
+    share_url: str,
+) -> dict | None:
+    """在动态列表里定位分享的那一条。"""
+    if cell_id:
+        for feed in msglist:
+            if str(feed.get("cellid") or "") == cell_id:
+                return feed
+
+    # 兜底：用分享链接里的时间戳/摘要去比对，再不行就取第一条
+    params = parse_share_url(share_url)
+    for key in ("begintime", "t", "time"):
+        raw = params.get(key) or ""
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if len(digits) >= 10:
+            want = int(digits[:10])
+            for feed in msglist:
+                created = _as_int(feed.get("created_time"))
+                if created and abs(created - want) <= 120:
+                    return feed
+    return msglist[0] if msglist else None
+
+
+def _post_from_feed(
+    feed: dict,
+    *,
+    share_url: str,
+    base: QzonePost | None = None,
+) -> QzonePost:
+    """把接口返回的一条 feed 转成 QzonePost。"""
+    post = base or QzonePost()
+    post.url = share_url
+    post.uin = _as_int(feed.get("uin")) or post.uin
+    post.name = str(feed.get("name") or post.name or "")
+    content = str(feed.get("content") or "").strip()
+    if content:
+        post.text = content
+    post.created_time = _as_int(feed.get("created_time")) or post.created_time
+    post.comment_count = _as_int(feed.get("cmtnum")) or post.comment_count
+    post.like_count = _as_int(feed.get("usenum")) or post.like_count
+    post.source_name = str(feed.get("source_name") or post.source_name or "")
+
+    rt_con = feed.get("rt_con")
+    if isinstance(rt_con, dict):
+        rt_text = str(rt_con.get("content") or "").strip()
+        if rt_text:
+            post.rt_text = rt_text
+
+    images = list(post.images)
+    for item in feed.get("pic") or []:
+        if not isinstance(item, dict):
+            continue
+        url = _best_image_url(item)
+        if url and url not in images:
+            images.append(url)
+    post.images = images
+
+    videos = list(post.videos)
+    for key in ("video", "rt_video"):
+        item = feed.get(key)
+        if isinstance(item, dict):
+            url = _best_image_url(item)
+            if url and url not in videos:
+                videos.append(url)
+    post.videos = videos
+    return post
+
+
+def _best_image_url(item: dict) -> str | None:
+    """在一张图片的多个尺寸里挑最大的那个。"""
+    for key in ("url3", "url2", "url1", "raw", "picrawurl", "originurl", "bigurl"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+            return value.strip()
+    return None
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+class CookieCache:
+    """缓存一份登录态，避免每条消息都去问协议端要 Cookie。"""
+
+    def __init__(self, ttl: int):
+        self._ttl = max(int(ttl), 0)
+        self._creds: QzoneCredentials | None = None
+        self._at: float = 0.0
+
+    def get(self) -> QzoneCredentials | None:
+        if self._creds is None:
+            return None
+        if self._ttl > 0 and monotonic() - self._at >= self._ttl:
+            return None
+        return self._creds
+
+    def put(self, creds: QzoneCredentials) -> None:
+        self._creds = creds
+        self._at = monotonic()
+
+    def clear(self) -> None:
+        self._creds = None
+        self._at = 0.0
