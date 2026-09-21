@@ -245,7 +245,13 @@ fetch_post(creds, share_url)
 | `fetch_bytes(session, url, headers, timeout)` | 下载图片字节，失败返回 `None` |
 | `prepare_images(session, urls, budget, ...)` | 按预算挑选图片，长图切片、其余原样 |
 
-常量：`DEFAULT_TALL_THRESHOLD=1600`、`DEFAULT_SLICE_HEIGHT=1280`、`DEFAULT_OVERLAP=80`、`MAX_SLICES_PER_IMAGE=12`、`JPEG_QUALITY=88`。
+常量：`DEFAULT_TALL_THRESHOLD=1600`、`DEFAULT_SLICE_HEIGHT=1280`、`DEFAULT_OVERLAP=80`、`MAX_SLICES_PER_IMAGE=12`、`JPEG_QUALITY=88`、`DEFAULT_MAX_WIDTH=1024`。
+
+| 函数 | 说明 |
+| --- | --- |
+| `downscale_if_wide(im, max_width)` | 宽度超上限时等比缩小（多数模型把长边压到约 1024，超出部分是浪费） |
+| `encode_plain(data, quality, max_width)` | 超宽普通图缩放并编码成 data URL；无需缩放时返回 `None` |
+| `_encode(im, quality)` | 统一的 JPEG → data URL 编码出口 |
 
 设计要点：
 
@@ -255,6 +261,30 @@ fetch_post(creds, share_url)
 - `PIL` 的 CPU 操作走 `asyncio.to_thread()`，不阻塞事件循环。
 - 任何一步失败都**退回原 URL 而不是丢弃图片**，保证降级路径不会让内容变少。
 - `budget`（即 `max_images`）是**最终张数上限**，切片计入其中。这是防止一本 14 张长图的瓜条被切成 50+ 片的关键。
+
+### 请求体积的三个杠杆（实测数据）
+
+一条真实瓜条（12 张长图 → 41 片）的实测结果，供调参参考：
+
+| 调整 | 体积 | 省 |
+| --- | --- | --- |
+| 基线 | 6.20 MB | — |
+| `image_max_width=1024` | 5.70 MB | -8% |
+| `jpeg_quality=75` | 4.25 MB | -31% |
+| 两者叠加 | 4.11 MB | -34% |
+| `max_images=12` | ~1.82 MB | -71% |
+
+**结论：数量是线性杠杆，压缩是边际收益。** 调 `max_images` 最有效，但代价是后面的图读不到。
+
+`JPEG_QUALITY=88` 这个值最初是拍的，**当时没算总体积** —— 后来实测才发现 41 张图能到 6.2 MB。
+现在它由 `jpeg_quality` 配置暴露，宽度上限也由 `image_max_width` 暴露，
+默认值保持与引入前一致（88 / 1024）。
+
+> `image_max_width=1024` 这个默认值与引入前**不完全等价**：之前超宽图原样发送，
+> 现在会被缩小（实测省 8%）。已向用户说明，可按需设 0 恢复原行为。
+
+**注意**：压缩对「聊天记录小字截图」的可读性影响**无法用脚本量化**，
+只能靠实际使用验证。因此默认值保守，且不主动替用户调低质量。
 
 ## FrontPage 数据结构
 
@@ -531,7 +561,7 @@ cd astrbot_plugin_qzone_reader
 python test_core.py
 ```
 
-当前 **189 项断言**。分段：
+当前 **196 项断言**。分段：
 
 | 段 | 覆盖 |
 | --- | --- |

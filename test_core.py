@@ -778,7 +778,29 @@ def main() -> int:
         out3 = asyncio.run(
             iu.prepare_images(sess3, ["http://x/n.jpg"], budget=4, slice_tall=True)
         )
-        check("普通图原样返回 URL", out3 == ["http://x/n.jpg"], str(out3))
+        # 1200x900 本身不是长截图；但宽超过默认上限 1024，会被缩放成 data URL
+        check(
+            "超宽普通图被缩放成 data URL",
+            len(out3) == 1 and out3[0].startswith("data:image/jpeg;base64,"),
+            str(out3)[:60],
+        )
+
+        # 窄图（宽 <= 上限）才应原样返回
+        narrow = make_image(600, 500)
+        sess3b = _Session(narrow)
+        out3b = asyncio.run(
+            iu.prepare_images(sess3b, ["http://x/n2.jpg"], budget=4, slice_tall=True)
+        )
+        check("窄图原样返回 URL", out3b == ["http://x/n2.jpg"], str(out3b))
+
+        # 关掉宽度限制后，宽图也应原样返回
+        sess3c = _Session(normal)
+        out3c = asyncio.run(
+            iu.prepare_images(
+                sess3c, ["http://x/n.jpg"], budget=4, slice_tall=True, max_width=0
+            )
+        )
+        check("max_width=0 时不缩放，原样返回", out3c == ["http://x/n.jpg"], str(out3c))
 
         sess4 = _Session(b"broken")
         out4 = asyncio.run(
@@ -797,12 +819,30 @@ def main() -> int:
     check("默认开启长图切片", bool(p.config.get("slice_tall_images", True)) is True)
     check(
         "切片高度留 0 时回退默认值",
-        (lambda v: (v if v > 0 else api.images.DEFAULT_SLICE_HEIGHT))(
-            int(p.config.get("slice_max_height", 0) or 0)
-        )
+        p._int_config("slice_max_height", 0, fallback=api.images.DEFAULT_SLICE_HEIGHT)
         == api.images.DEFAULT_SLICE_HEIGHT,
     )
     check("已移除隐藏硬上限 HARD_IMAGE_CAP", not hasattr(main_mod, "HARD_IMAGE_CAP"))
+
+    check("默认图片宽度上限为 1024", p._int_config(
+        "image_max_width", api.images.DEFAULT_MAX_WIDTH, allow_zero=True
+    ) == 1024)
+    check("宽度上限设为 0 表示不限制", make_plugin(
+        main_mod, api, {"image_max_width": 0}
+    )._int_config("image_max_width", 1024, allow_zero=True) == 0)
+    check("默认 JPEG 质量为 88", p._int_config(
+        "jpeg_quality", api.images.JPEG_QUALITY
+    ) == 88)
+    check("质量可调低", make_plugin(
+        main_mod, api, {"jpeg_quality": 75}
+    )._int_config("jpeg_quality", 88) == 75)
+    check(
+        "非法质量值回退默认",
+        make_plugin(main_mod, api, {"jpeg_quality": "abc"})._int_config(
+            "jpeg_quality", 88
+        )
+        == 88,
+    )
 
     print("\n[18] 上下文保留模式 context_mode")
     from astrbot.core.agent.message import TextPart as _TextPart, ImageURLPart as _ImgPart

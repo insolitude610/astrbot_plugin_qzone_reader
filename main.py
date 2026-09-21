@@ -188,7 +188,7 @@ class QzoneReaderPlugin(Star):
         budget: int,
         headers: dict[str, str],
     ) -> list[str]:
-        """按预算准备配图，长截图会切片后再给模型。
+        """按预算准备配图：长截图切片、超宽图缩放。
 
         budget 是最终图片总数上限，切片计入其中 —— 否则一本瓜条的十余张
         长图能切成几十片，token 会失控。
@@ -196,15 +196,17 @@ class QzoneReaderPlugin(Star):
         if budget <= 0 or not candidates:
             return []
         slice_tall = bool(self.config.get("slice_tall_images", True))
-        if not slice_tall:
-            return candidates[:budget]
+        slice_height = self._int_config(
+            "slice_max_height", 0, fallback=image_utils.DEFAULT_SLICE_HEIGHT
+        )
+        max_width = self._int_config(
+            "image_max_width", image_utils.DEFAULT_MAX_WIDTH, allow_zero=True
+        )
+        quality = self._int_config("jpeg_quality", image_utils.JPEG_QUALITY)
 
-        try:
-            slice_height = int(self.config.get("slice_max_height", 0) or 0)
-        except (TypeError, ValueError):
-            slice_height = 0
-        if slice_height <= 0:
-            slice_height = image_utils.DEFAULT_SLICE_HEIGHT
+        # 既没开切片、也不限宽度时无需任何处理
+        if not slice_tall and (not max_width or max_width <= 0):
+            return candidates[:budget]
 
         timeout = aiohttp.ClientTimeout(total=30)
         try:
@@ -214,12 +216,30 @@ class QzoneReaderPlugin(Star):
                     candidates,
                     budget=budget,
                     headers=headers,
-                    slice_tall=True,
+                    slice_tall=slice_tall,
                     slice_height=slice_height,
+                    quality=quality,
+                    max_width=max_width,
                 )
         except Exception as exc:  # noqa: BLE001 - 图片处理失败不该打断对话
             logger.warning("[qzone_reader] 配图处理失败，退回原始地址: %s", exc)
             return candidates[:budget]
+
+    def _int_config(self, key: str, default: int, *, fallback: int | None = None, allow_zero: bool = False) -> int:
+        """读一个整数配置，非法值回退。
+
+        fallback 用于「0 表示用默认值」的配置（如 slice_max_height）；
+        allow_zero 用于「0 表示不限制」的配置（如 image_max_width）。
+        """
+        try:
+            value = int(self.config.get(key, default) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value <= 0:
+            if allow_zero:
+                return 0
+            return fallback if fallback is not None else default
+        return value
 
     async def _fetch_with_retry(
         self, event: AstrMessageEvent, creds: QzoneCredentials, share_url: str
