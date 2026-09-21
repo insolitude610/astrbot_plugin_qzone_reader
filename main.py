@@ -112,9 +112,15 @@ class QzoneReaderPlugin(Star):
                 return self._with_instruction(body, auto_summary), []
             return FAILURE_HINT, []
 
+        # 转发场景下原文配图才是主体，优先附上，剩余额度再给外层配图
         images: list[str] = []
         if max_images > 0:
-            images = post.images[: min(max_images, HARD_IMAGE_CAP)]
+            cap = min(max_images, HARD_IMAGE_CAP)
+            for url in [*post.original_images, *post.images]:
+                if url not in images:
+                    images.append(url)
+                if len(images) >= cap:
+                    break
 
         body = post.to_prompt(max_images=len(images))
         return self._with_instruction(body, auto_summary), images

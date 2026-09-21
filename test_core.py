@@ -79,12 +79,22 @@ def load_module():
     core_pkg.__path__ = [str(PLUGIN_DIR / "core")]  # type: ignore[attr-defined]
     sys.modules[f"{PKG_NAME}.core"] = core_pkg
 
+    # qzone_api 会 `from . import frontpage`，先把同包模块挂上
+    fp_spec = importlib.util.spec_from_file_location(
+        f"{PKG_NAME}.core.frontpage", PLUGIN_DIR / "core" / "frontpage.py"
+    )
+    fp_module = importlib.util.module_from_spec(fp_spec)
+    sys.modules[fp_spec.name] = fp_module
+    setattr(core_pkg, "frontpage", fp_module)
+    fp_spec.loader.exec_module(fp_module)
+
     spec = importlib.util.spec_from_file_location(
         f"{PKG_NAME}.core.qzone_api", PLUGIN_DIR / "core" / "qzone_api.py"
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    module.frontpage = fp_module
     return module
 
 
@@ -272,6 +282,7 @@ def main() -> int:
         def get(self, url, **kw):
             class R:
                 url = "https://mobile.qzone.qq.com/l?g=1502&i=x&u=1596574632"
+                status = 200
 
                 async def __aenter__(self):
                     return self
@@ -312,6 +323,72 @@ def main() -> int:
 
     check("短链无法定位时返回 None", got is None, repr(got))
     check("且完全没有去查动态列表（不读自身空间）", calls["msglist"] == 0, str(calls))
+
+    print("\n[8d] 转发说说：必须读到被转发的原文，而不是只剩外层评语")
+    fp = api.frontpage
+    fixture_path = PLUGIN_DIR / "tests" / "fixtures" / "repost_cell.json"
+    check("转发 fixture 存在", fixture_path.exists(), str(fixture_path))
+    if fixture_path.exists():
+        cell_json = fixture_path.read_text(encoding="utf-8")
+        # 复刻真实页面：JS 对象字面量（键带引号、含 // 注释）
+        html = (
+            "<html><script>var FrontPage = {\n"
+            " loginUin : 'NaN', // 页面注释\n"
+            ' module : "detail",\n'
+            f" data : {cell_json}\n"
+            "};</script></html>"
+        )
+        cell = fp.extract_share_post(html)
+        check("能从页面里解出 cell", cell is not None)
+
+        if cell:
+            post = api._post_from_cell(cell, url="https://h5.qzone.qq.com/ugc/share/?x=1")
+            check("识别为转发", post.is_repost())
+            check("外层是转发者的评语", "玩的都比我花" in post.text, post.text)
+            check(
+                "读到被转发的原文正文",
+                len(post.original_text) > 100,
+                f"原文长度 {len(post.original_text)}",
+            )
+            check(
+                "原文正文里含瓜条关键内容",
+                "野狗聚一窝" in post.original_text,
+                post.original_text[:80],
+            )
+            check("原文作者 uin 正确", post.original_uin == 3484486902, str(post.original_uin))
+            check("转发者 uin 正确", post.uin == 1596574632, str(post.uin))
+            check("原文发布时间早于转发时间", 0 < post.original_time < post.created_time)
+            check(
+                "原文配图被读到",
+                len(post.original_images) >= 3,
+                f"{len(post.original_images)} 张",
+            )
+            check(
+                "图片 URL 是 http 开头",
+                all(u.startswith("http") for u in post.original_images),
+            )
+
+            rendered = post.to_prompt(max_images=2)
+            check("渲染含转发者评语", "玩的都比我花" in rendered)
+            check("渲染含原文作者", post.original_name in rendered)
+            check("渲染含原文正文", "野狗聚一窝" in rendered)
+            check(
+                "原文正文不重复出现",
+                rendered.count("野狗聚一窝") == 1,
+                f"出现 {rendered.count('野狗聚一窝')} 次",
+            )
+            check("渲染含原文配图说明", "原文配图" in rendered, rendered[-200:])
+            check("渲染标注了转发关系", "转发的原内容" in rendered)
+
+            # 非转发不应带原文区块
+            plain_cell = {
+                "cell_comm": {"time": 1700000000},
+                "cell_userinfo": {"user": {"uin": 10001, "nickname": "某人"}},
+                "cell_summary": {"summary": "普通说说"},
+            }
+            plain = api._post_from_cell(plain_cell, url="u")
+            check("普通说说不被当成转发", plain is not None and not plain.is_repost())
+            check("普通说说渲染无原文区块", "转发的原内容" not in plain.to_prompt())
 
     print("\n[9] 插件组装逻辑（注入文本 + 图片裁剪）")
     main_mod = load_main_module()

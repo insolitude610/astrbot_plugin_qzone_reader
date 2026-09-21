@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 import aiohttp
 from astrbot.api import logger
 
+from . import frontpage
+
 # 说说列表 / 单条详情接口
 LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
 DETAIL_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msgdetail_v6"
@@ -72,7 +74,11 @@ class QzoneCredentials:
 
 @dataclass
 class QzonePost:
-    """一条说说的可读内容。"""
+    """一条说说的可读内容。
+
+    转发（repost）要分两层表达：外层是转发者加的评语，
+    原文在 original_* 字段里。只有外层会让模型完全看不到原文。
+    """
 
     uin: int = 0
     name: str = ""
@@ -87,16 +93,36 @@ class QzonePost:
     location: str = ""
     url: str = ""
 
+    # 被转发的原说说（没有转发时全部为空）
+    original_name: str = ""
+    original_uin: int = 0
+    original_time: int = 0
+    original_text: str = ""
+    original_images: list[str] = field(default_factory=list)
+
+    def is_repost(self) -> bool:
+        return bool(self.original_name or self.original_uin or self.original_time)
+
     def is_empty(self) -> bool:
-        return not (self.text.strip() or self.rt_text.strip() or self.images or self.videos)
+        return not (
+            self.text.strip()
+            or self.rt_text.strip()
+            or self.original_text.strip()
+            or self.images
+            or self.videos
+            or self.original_images
+        )
 
     def to_prompt(self, *, max_images: int = 0) -> str:
         """渲染成一段给模型看的纯文本。"""
+        repost = self.is_repost()
         lines: list[str] = ["【QQ空间说说原文】"]
         if self.name:
-            lines.append(f"作者：{self.name}" + (f"（QQ {self.uin}）" if self.uin else ""))
+            role = "转发者" if repost else "作者"
+            lines.append(f"{role}：{self.name}" + (f"（QQ {self.uin}）" if self.uin else ""))
         if self.created_time:
-            lines.append(f"发布时间：{format_time(self.created_time)}")
+            label = "转发时间" if repost else "发布时间"
+            lines.append(f"{label}：{format_time(self.created_time)}")
         if self.source_name:
             lines.append(f"来源：{self.source_name}")
         if self.location:
@@ -106,13 +132,41 @@ class QzonePost:
         if not body:
             body = "（这条说说没有文字内容）"
         lines.append("")
-        lines.append("正文：")
+        lines.append("转发语：" if repost else "正文：")
         lines.append(body)
 
         if self.rt_text.strip():
             lines.append("")
-            lines.append("转发/引用内容：")
+            lines.append("引用内容：")
             lines.append(self.rt_text.strip())
+
+        # 转发场景下，被转发的原文才是主体内容
+        if repost:
+            lines.append("")
+            lines.append("—— 以下是这条说说转发的原内容 ——")
+            who = self.original_name or "未知作者"
+            if self.original_uin:
+                who += f"（QQ {self.original_uin}）"
+            lines.append(f"原文作者：{who}")
+            if self.original_time:
+                lines.append(f"原文发布时间：{format_time(self.original_time)}")
+            lines.append("")
+            lines.append("原文正文：")
+            lines.append(
+                self.original_text.strip()
+                or "（被转发的原说说没有文字内容，或未能读取到）"
+            )
+            if self.original_images:
+                if max_images > 0:
+                    shown = min(len(self.original_images), max_images)
+                    lines.append(
+                        f"原文配图：共 {len(self.original_images)} 张，"
+                        f"已附带前 {shown} 张图片。"
+                    )
+                else:
+                    lines.append(
+                        f"原文配图：共 {len(self.original_images)} 张（未附带图片内容）。"
+                    )
 
         if self.images:
             if max_images > 0:
@@ -271,58 +325,175 @@ async def fetch_post(
     *,
     timeout: int = 20,
 ) -> QzonePost | None:
-    """按分享链接拉取该条说说的完整内容。"""
-    params = parse_share_url(share_url)
+    """按分享链接拉取该条说说的完整内容。
 
+    优先解析 h5 分享页：页面内嵌的 FrontPage 数据里含完整正文、配图，
+    并且**转发场景下带有被转发的原文（cell_original）**，
+    这是列表接口给不了的。分享页拿不到时才退回列表接口。
+    """
     conn_timeout = aiohttp.ClientTimeout(total=timeout)
     async with aiohttp.ClientSession(timeout=conn_timeout) as session:
         # 短链（mobile.qzone.qq.com/l）本身不带 res_uin/cellid，
         # 必须先跟随跳转拿到 h5 分享页地址，否则无法确定是哪条说说。
         final_url, final_params = await _resolve_share(session, creds, share_url)
-        if _has_feed_locator(final_params):
-            params = final_params
-
-        host_uin = _extract_host_uin(params)
-        if not host_uin:
-            # 认不出是谁的说说就放弃。绝不退回自己的 uin —— 那会读到
-            # 机器人自己空间的第一条说说，并把无关内容注入对话。
-            logger.warning(
-                "[qzone_reader] 分享链接里没有可用的说说定位参数，放弃读取: %s",
-                share_url,
-            )
-            return None
-
         if final_url != share_url:
             logger.info("[qzone_reader] 分享短链已解析为: %s", final_url)
 
-        cell_id = str(params.get("cellid") or params.get("fid") or "")
-
-        msglist, error = await _fetch_msglist(session, creds, int(host_uin))
-        if error in AUTH_ERROR_CODES:
-            raise QzoneAuthError(f"QQ空间登录态失效（code={error}）")
-        if not msglist:
-            return None
-
-        picked = _pick_feed(msglist, cell_id=cell_id, share_url=final_url or share_url)
-        if picked is None:
-            logger.warning(
-                "[qzone_reader] 在 uin=%s 的动态里没找到该条说说（cellid=%s），放弃",
-                host_uin,
-                cell_id or "无",
-            )
-            return None
-
-        post = _post_from_feed(picked, share_url=final_url or share_url)
-
-        # 列表接口的正文可能被截断，命中后用详情接口拿全文
-        tid = str(picked.get("tid") or "")
-        if tid:
-            detail = await _fetch_detail(session, creds, int(host_uin), tid)
-            if detail:
-                post = _post_from_feed(
-                    detail, share_url=final_url or share_url, base=post
+        # 首选：直接读分享页
+        post = await _fetch_from_share_page(session, creds, final_url or share_url)
+        if post is not None and not post.is_empty():
+            if post.is_repost():
+                logger.info(
+                    "[qzone_reader] 这是一条转发：原作者 %s（QQ %s），已连同原文一起读取",
+                    post.original_name or "未知",
+                    post.original_uin or "未知",
                 )
-        return post
+            return post
+
+        logger.info("[qzone_reader] 分享页没取到内容，改走动态列表接口兜底")
+        return await _fetch_via_msglist(
+            session, creds, share_url, final_url, final_params
+        )
+
+
+async def _fetch_from_share_page(
+    session: aiohttp.ClientSession,
+    creds: QzoneCredentials,
+    url: str,
+) -> QzonePost | None:
+    """抓 h5 分享页并解析其中的说数据。"""
+    for candidate in _share_page_candidates(url):
+        html = await _get_html(session, candidate, creds)
+        if not html or "FrontPage" not in html:
+            continue
+        cell = frontpage.extract_share_post(html)
+        if not cell:
+            continue
+        post = _post_from_cell(cell, url=candidate)
+        if post is not None:
+            return post
+    return None
+
+
+def _share_page_candidates(url: str) -> list[str]:
+    """分享页可能有几种等价地址，逐个试。"""
+    out: list[str] = []
+    if url:
+        out.append(url)
+        # 有的分享页只在带尾斜杠的 /ugc/share/ 下返回数据
+        if "/ugc/share?" in url:
+            out.append(url.replace("/ugc/share?", "/ugc/share/?", 1))
+        elif "/ugc/share/?" not in url and "/ugc/share/" in url:
+            pass
+    seen: list[str] = []
+    for item in out:
+        if item not in seen:
+            seen.append(item)
+    return seen
+
+
+def _post_from_cell(cell: dict, *, url: str) -> QzonePost | None:
+    """把分享页的一个 cell 转成 QzonePost（含转发的原文）。"""
+    if not isinstance(cell, dict):
+        return None
+
+    post = QzonePost(url=url)
+    post.uin, post.name = frontpage.cell_author(cell)
+    post.text = frontpage.cell_text(cell)
+    post.created_time = frontpage.cell_time(cell)
+    post.images = frontpage.cell_images(cell)
+    post.videos = frontpage.cell_video(cell)
+
+    # 转发：外层评语留在 text，原文单独放进 original_* 字段
+    original = frontpage.cell_original(cell)
+    if original:
+        post.original_text = frontpage.cell_text(original)
+        post.original_uin, post.original_name = frontpage.cell_author(original)
+        post.original_time = frontpage.cell_time(original)
+        post.original_images = frontpage.cell_images(original)
+        # 外层自己的配图并入原图，保证图片不丢
+        for img in post.images:
+            if img not in post.original_images:
+                post.original_images.append(img)
+        post.images = []
+
+    if post.is_empty():
+        return None
+    return post
+
+
+async def _fetch_via_msglist(
+    session: aiohttp.ClientSession,
+    creds: QzoneCredentials,
+    share_url: str,
+    final_url: str,
+    final_params: dict[str, str],
+) -> QzonePost | None:
+    """兜底路径：用动态列表接口定位并读取。"""
+    params = final_params if _has_feed_locator(final_params) else parse_share_url(share_url)
+
+    host_uin = _extract_host_uin(params)
+    if not host_uin:
+        # 认不出是谁的说说就放弃。绝不退回自己的 uin —— 那会读到
+        # 机器人自己空间的第一条说说，并把无关内容注入对话。
+        logger.warning(
+            "[qzone_reader] 分享链接里没有可用的说说定位参数，放弃读取: %s",
+            share_url,
+        )
+        return None
+
+    cell_id = str(params.get("cellid") or params.get("fid") or "")
+
+    msglist, error = await _fetch_msglist(session, creds, int(host_uin))
+    if error in AUTH_ERROR_CODES:
+        raise QzoneAuthError(f"QQ空间登录态失效（code={error}）")
+    if not msglist:
+        return None
+
+    picked = _pick_feed(msglist, cell_id=cell_id, share_url=final_url or share_url)
+    if picked is None:
+        logger.warning(
+            "[qzone_reader] 在 uin=%s 的动态里没找到该条说说（cellid=%s），放弃",
+            host_uin,
+            cell_id or "无",
+        )
+        return None
+
+    post = _post_from_feed(picked, share_url=final_url or share_url)
+
+    # 列表接口的正文可能被截断，命中后用详情接口拿全文
+    tid = str(picked.get("tid") or "")
+    if tid:
+        detail = await _fetch_detail(session, creds, int(host_uin), tid)
+        if detail:
+            post = _post_from_feed(detail, share_url=final_url or share_url, base=post)
+    return post
+
+
+async def _get_html(
+    session: aiohttp.ClientSession,
+    url: str,
+    creds: QzoneCredentials,
+) -> str:
+    """请求一个页面并解码为文本（分享页可能是 utf-8 或 gbk）。"""
+    try:
+        async with session.get(
+            url, headers=creds.headers(), allow_redirects=True
+        ) as resp:
+            if resp.status >= 400:
+                logger.warning("[qzone_reader] 分享页返回 HTTP %s", resp.status)
+                return ""
+            raw = await resp.read()
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        logger.warning("[qzone_reader] 抓取分享页失败: %s", exc)
+        return ""
+
+    for encoding in ("utf-8", "gbk", "gb18030"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def _has_feed_locator(params: dict[str, str]) -> bool:
