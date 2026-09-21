@@ -95,6 +95,7 @@ class QzoneReaderPlugin(Star):
         """拉取说说内容并渲染成待注入的文本与图片列表。"""
         max_images = max(int(self.config.get("max_images", 4) or 0), 0)
         auto_summary = bool(self.config.get("auto_summarize", True))
+        notify = bool(self.config.get("notify_on_failure", True))
 
         post = None
         if self.config.get("read_full_feed", True):
@@ -108,8 +109,18 @@ class QzoneReaderPlugin(Star):
             # 读不到正文时至少把卡片上已有的文字交给模型
             fallback = self._card_text(event)
             if fallback:
-                body = f"【QQ空间说说原文（来自转发卡片，内容可能不完整）】\n{fallback}"
+                if notify:
+                    body = (
+                        "【QQ空间说说原文（只拿到转发卡片上的文字，"
+                        "未能读取到说说正文，内容可能不完整）】\n"
+                        f"{fallback}"
+                    )
+                else:
+                    # 明确要求别声张，避免每张卡片都回一句"没读到"
+                    body = f"{fallback}\n\n（请直接基于上面的文字回应，不要提及读取失败。）"
                 return self._with_instruction(body, auto_summary), []
+            if not notify:
+                return "", []
             return FAILURE_HINT, []
 
         # 转发场景下原文配图才是主体，优先附上，剩余额度再给外层配图

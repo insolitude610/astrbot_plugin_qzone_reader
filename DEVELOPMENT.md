@@ -1,0 +1,454 @@
+# 开发文档
+
+面向维护者。用户使用说明见 [README.md](README.md)。
+
+## 目录
+
+- [整体思路](#整体思路)
+- [模块结构](#模块结构)
+- [数据流](#数据流)
+- [API 参考](#api-参考)
+- [FrontPage 数据结构](#frontpage-数据结构)
+- [关键设计决策](#关键设计决策)
+- [两个必须知道的 AstrBot 陷阱](#两个必须知道的-astrbot-陷阱)
+- [测试](#测试)
+- [调试](#调试)
+- [扩展指引](#扩展指引)
+- [已知脆弱点](#已知脆弱点)
+
+## 整体思路
+
+插件做三件事，顺序不能颠倒：
+
+1. **在消息阶段**认出 QQ空间分享链接，**提前**把内容取回来；
+2. **在 LLM 请求阶段**把内容注入请求；
+3. 让 AstrBot 自己去落历史 —— 插件**不碰**会话历史。
+
+第 1 步和第 2 步必须拆开，原因是注入只能发生在 `on_llm_request`，而那时事件已经定型；网络请求放在那里会阻塞 LLM 请求链路，所以提前取好、暂存在插件里。
+
+第 3 步是「能持续讨论」的关键：**不要自己写历史**。AstrBot 会把 `req.prompt` + `req.extra_user_content_parts` + `req.image_urls` 组装成同一条 user 消息，再由 `_save_to_history()` 落库。注入的内容因此天然进入历史，无需额外处理。
+
+## 模块结构
+
+```
+astrbot_plugin_qzone_reader/
+├── main.py                    # 插件入口：卡片识别、登录态获取、注入
+├── core/
+│   ├── __init__.py            # 包说明
+│   ├── frontpage.py           # 解析 h5 分享页内嵌的 FrontPage 数据
+│   └── qzone_api.py           # 数据模型、链接识别、HTTP 调用、降级逻辑
+├── tests/fixtures/
+│   └── repost_cell.json       # 脱敏后的转发说说数据，供回归测试用
+├── test_core.py               # 自测脚本（无 AstrBot 依赖，见「测试」）
+├── _conf_schema.json          # 配置项定义
+└── metadata.yaml              # 插件元数据
+```
+
+职责边界：
+
+| 模块 | 负责 | 不负责 |
+| --- | --- | --- |
+| `main.py` | AstrBot 交互、事件过滤、登录态来源、注入、降级决策 | 任何 HTML/JSON 解析 |
+| `core/qzone_api.py` | 链接识别、参数提取、HTTP、降级编排、渲染成文本 | AstrBot 相关逻辑 |
+| `core/frontpage.py` | 纯函数：从 HTML 里解出说说数据结构 | 网络、AstrBot |
+
+`core/frontpage.py` 刻意做成**零依赖纯函数模块**，可以脱离整个插件单独测试。
+
+## 数据流
+
+```
+① 消息事件
+   capture_qzone_share(event)
+     ├─ _in_scope(event)              会话白名单
+     ├─ _find_share_url(event)        识别链接
+     │    ├─ Comp.Json.data           ← 主路径（分享卡片）
+     │    ├─ Comp.Plain 文本          ← 直接粘贴链接
+     │    ├─ event.message_str
+     │    └─ message_obj.raw_message  ← 兜底（适配器未解析的卡片类型）
+     ├─ _build_payload(event, url)    取内容
+     │    ├─ _get_credentials()       登录态（带缓存）
+     │    └─ _fetch_with_retry()      → fetch_post()（见下）
+     └─ self._pending[id(event)] = (text, images)   暂存
+
+② LLM 请求钩子
+   inject_qzone_content(event, req)
+     ├─ self._pending.pop(id(event))  取出并清理暂存
+     ├─ _platform_ok(event)           手动平台门禁（见「陷阱」）
+     ├─ req.extra_user_content_parts.append(TextPart(text))
+     └─ req.image_urls.extend(images)
+
+③ AstrBot 内部
+   assemble_context() → 组装成一条 user 消息 → _save_to_history() → 会话历史
+```
+
+`fetch_post()` 内部的取数优先级：
+
+```
+fetch_post(creds, share_url)
+  │
+  ├─ _resolve_share()                  跟随 302 跳转，拿最终地址与参数
+  │
+  ├─ 首选：_fetch_from_share_page()    解析 h5 分享页
+  │     ├─ _share_page_candidates()    候选地址（带/不带尾斜杠）
+  │     ├─ _get_html()                 抓页面并试 utf-8 / gbk
+  │     ├─ frontpage.extract_share_post()
+  │     └─ _post_from_cell()           转成 QzonePost（含 cell_original）
+  │
+  └─ 兜底：_fetch_via_msglist()        列表接口
+        ├─ _extract_host_uin()         只认明确字段，认不出就放弃
+        ├─ _fetch_msglist()            emotion_cgi_msglist_v6
+        ├─ _pick_feed()                定位；定位不到返回 None
+        └─ _fetch_detail()             取全文
+```
+
+## API 参考
+
+### `main.py`
+
+| 成员 | 说明 |
+| --- | --- |
+| `QzoneReaderPlugin.capture_qzone_share(event)` | `@filter.event_message_type(ALL)`。识别链接并预取内容，结果存入 `_pending` |
+| `QzoneReaderPlugin.inject_qzone_content(event, req)` | `@filter.on_llm_request()`。注入文本与图片 |
+| `_build_payload(event, share_url) -> (str, list[str])` | 取内容 + 渲染 + 决定附图，返回待注入文本与图片 URL |
+| `_fetch_with_retry(event, creds, url)` | 登录态失效时清缓存重取一次 |
+| `_get_credentials(event)` | 按 `cookie_source` 取登录态，带 TTL 缓存与手动兜底 |
+| `_credentials_from_protocol(event)` | 调 `get_cookies`，依次试 `user.qzone.qq.com`、`qzone.qq.com` |
+| `_call_get_cookies(client, domain)` | 兼容 `client.call_action` 与 `client.api.call_action` 两种挂载 |
+| `_get_bot(event)` | 取协议端实例，`event.bot` 优先，回退 `context.get_platform_inst()` |
+| `_platform_ok(event)` | 手动平台门禁，只放行 `aiocqhttp` |
+| `_find_share_url(event)` | 从消息链找分享链接 |
+| `_card_text(event)` | 取卡片自带的标题/摘要，作为降级内容 |
+| `_in_scope(event)` | 会话白名单判断 |
+| `_with_instruction(body, auto_summary)` | 按配置附加/不附加总结指令 |
+| `_append_extra_part(req, text)` | 注入文本块，优先 `TextPart`，取不到退回 dict |
+
+模块级常量：
+
+| 常量 | 说明 |
+| --- | --- |
+| `HARD_IMAGE_CAP = 9` | 图片数硬上限，防止上下文被撑爆 |
+| `SUMMARIZE_INSTRUCTION` | 自动总结指令 |
+| `FAILURE_HINT` | 读取失败时给模型的提示，明确要求「不要编造」 |
+
+### `core/qzone_api.py`
+
+数据模型：
+
+| 类型 | 说明 |
+| --- | --- |
+| `QzoneCredentials` | `uin` / `skey` / `p_skey` / `source`；`gtk` 属性推导 `g_tk`；`headers()` 生成请求头 |
+| `QzonePost` | 一条说说的可读内容，转发用 `original_*` 字段表达第二层 |
+| `QzoneAuthError` | 登录态失效。调用方据此清缓存重取 |
+| `CookieCache` | 带 TTL 的登录态缓存，`ttl=0` 表示不缓存 |
+
+`QzonePost` 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `uin` / `name` / `created_time` | 外层（转发场景下即转发者） |
+| `text` | 外层正文；转发场景下是转发语 |
+| `rt_text` | 引用内容（外层显式引用时才有） |
+| `images` / `videos` | 外层配图与视频 |
+| `original_name` / `original_uin` / `original_time` | 被转发的原文元信息 |
+| `original_text` | 被转发的原文正文 |
+| `original_images` | 被转发的原文配图（外层的图会并入这里） |
+| `url` | 最终分享页地址 |
+
+方法：`is_repost()`、`is_empty()`、`to_prompt(max_images=0)`。
+
+链接与卡片：
+
+| 函数 | 说明 |
+| --- | --- |
+| `extract_share_url(payload)` | 递归扫描任意 JSON/文本，找出 QQ空间分享地址。会先 `unescape`，因为 QQ 卡片把逗号转义成 `&#44;` |
+| `extract_card_text(payload, limit=300)` | 取卡片标题/摘要作为降级文案 |
+| `parse_share_url(url)` | 解析 query。分隔符同时支持 `&` 和 `,` |
+| `credentials_from_cookie_string(s, source)` | 解析 Cookie，缺 `uin`/`skey` 返回 `None` |
+| `_extract_host_uin(params)` | 只认 `res_uin`/`host_uin`/`uin` 且校验位数 |
+| `_has_feed_locator(params)` | 判断一组参数能否定位到具体说说 |
+| `_looks_like_share(url)` | 是否是说说分享链接 |
+
+取数：
+
+| 函数 | 说明 |
+| --- | --- |
+| `fetch_post(creds, url, timeout=20)` | 总入口，分享页优先、列表接口兜底 |
+| `_resolve_share(session, creds, url)` | 跟随跳转拿最终地址；失败则从 HTML 里找 |
+| `_fetch_from_share_page(...)` | 抓分享页并解析 |
+| `_share_page_candidates(url)` | 生成候选地址 |
+| `_post_from_cell(cell, url)` | cell → `QzonePost`，处理转发两层 |
+| `_fetch_via_msglist(...)` | 列表接口路径 |
+| `_fetch_msglist(...)` / `_fetch_detail(...)` | 两个 cgi 接口，返回 `(数据, 错误码)` |
+| `_pick_feed(msglist, cell_id, share_url)` | 定位说说；**定位不到返回 `None`，绝不猜** |
+| `_post_from_feed(feed, share_url, base)` | feed → `QzonePost` |
+| `_get_html` / `_get_text` / `_loads_jsonp` | 传输层，含编码兜底与 jsonp 解包 |
+
+### `core/frontpage.py`
+
+纯函数，无网络无 AstrBot 依赖。
+
+| 函数 | 说明 |
+| --- | --- |
+| `extract_share_post(html)` | 从 HTML 解出说说 cell 字典，失败返回 `None` |
+| `cell_text(cell)` | 正文 |
+| `cell_time(cell)` | 发布时间 |
+| `cell_author(cell)` | `(uin, 昵称)` |
+| `cell_images(cell, limit=0)` | 配图，自动挑最大尺寸 |
+| `cell_video(cell)` | 视频地址 |
+| `cell_original(cell)` | 被转发的原文 cell |
+| `is_repost(cell)` | 是否转发 |
+
+内部解析器（`_` 前缀为私有，但测试会直接用）：
+
+- `_frontpage_object_starts(source)` — 找 `FrontPage = {` 的位置，排除 `xxxFrontPage` 这类更长标识符
+- `_balanced_object(source, start)` — 按括号配平切出对象，正确跳过字符串转义与 `//`、`/* */` 注释
+- `_extract_top_level_value(outer, key)` — 在对象第一层取 `key: {...}`
+
+## FrontPage 数据结构
+
+h5 分享页里有一段 JS 赋值，结构如下：
+
+```javascript
+var FrontPage = {
+  loginUin : 'NaN',
+  module : "detail",
+  data : { ret:0, code:0, message:"", data: { /* 真正的说说数据 */ } }
+};
+```
+
+`data.data` 的关键字段：
+
+| 字段 | 内容 |
+| --- | --- |
+| `cell_comm` | `time` 发布时间、`appid`、`ugckey`（格式 `<uin>_<appid>_<cellid>_`）、`curlikekey`、`orglikekey` |
+| `cell_userinfo.user` | `uin`、`nickname` |
+| `cell_summary.summary` | **正文** |
+| `cell_pic.picdata[]` | 配图数组，见下 |
+| `cell_original` | **被转发的原文**，结构与外层同构（可递归） |
+| `cell_comment` / `cell_like` | 评论与点赞 |
+| `cell_remark` | 如「共 15张照片」 |
+
+`picdata[]` 每一项：
+
+| 字段 | 内容 |
+| --- | --- |
+| `photourl` | 多档尺寸的对象，键为 `"0"`/`"1"`/`"11"` 等，值含 `url`/`width`/`height` |
+| `raw` / `sloc` | 原始地址 |
+| `videoflag` / `videodata` | 视频标记与地址 |
+| `lloc` | 内部定位串（不是 URL） |
+
+**挑图策略**：优先 `photourl` 里 `width*height` 最大的；URL 含 `/o&`、`/b&`、`origin`、`raw`、`large` 等原图特征再加权；键为 `"0"` 的加一点权重。都没有才退回 `raw`/`sloc`。
+
+### 转发的判定
+
+`cell_original` 存在即为转发。分享页在 `cell_comm` 里也给了线索：
+
+```
+curlikekey : http://user.qzone.qq.com/<转发者uin>/mood/<当前cellid>
+orglikekey : http://user.qzone.qq.com/<原作者uin>/mood/<原cellid>
+```
+
+超长瓜条会触发一个坑：当正文超过一定长度时，QQ空间会把正文挪到 `cell_original` 里，
+外层正文变成「本文转自…」之类的引导语。所以**判断转发不能只看 `cell_original` 是否存在**。
+
+当前实现没有专门处理这个情形：一律把 `cell_original` 的内容当原文渲染。
+结果是外层显示引导语、原文区块显示真正的长正文 —— **内容不丢，只是标签略有偏差**。
+
+如果要精确区分「用户真的转了别人的说说」和「正文太长被折叠」，
+`cell_comm.actiontype` 是一个候选判据（实测转发说说与原文的该字段取值不同），
+但具体取值语义尚未确认，改之前请先抓真实响应核对，不要凭猜测下判据。
+
+## 关键设计决策
+
+### 为什么改走分享页而不是列表接口
+
+最初用 `emotion_cgi_msglist_v6`，实测必然失败：
+
+- 分享短链解析后的 `res_uin` 是 **uid 不是 QQ 号**，拿它查列表查的是别人；
+- `cellid` 是 **h5 分享页的标识**，和列表接口返回的 cellid 不是同一套，永远匹配不上；
+- 即使匹配上，转发内容在 `rt_con` 里只有一个 `content` 字段，**原文图片完全没有**。
+
+分享页的 `FrontPage` 数据里 `cell_original` 是完整结构，正文、配图、作者、时间都齐，这才是正确来源。
+
+### 为什么 `_pick_feed` 不用 `msglist[0]` 兜底
+
+**这是踩过的坑。** 早期实现在 `cellid` 匹配不上时用 `msglist[0]` 兜底，导致：
+
+> 用户转发 A 的说说，插件查到的是机器人自己空间的动态，
+> 然后随手取第一条，把**完全无关的说说**注入给了用户。
+
+宁可如实返回 `None` 走降级，也不能猜。`_extract_host_uin` 同样：认不出就放弃，**绝不退回自己的 uin**。`test_core.py` 的 `[8c]` 段专门钉死这两点。
+
+### 为什么登录态要带 TTL 缓存
+
+`get_cookies` 是 OAuth 调用，每次消息都问一遍协议端没有必要。默认缓存 600 秒。失效时从两条路发现：接口返回 `AUTH_ERROR_CODES`（抛 `QzoneAuthError`），或请求异常。两种情况都会清缓存重取一次。
+
+### 为什么内容要提前取
+
+`on_llm_request` 里做网络请求会阻塞 LLM 请求链路（AstrBot 在那里持有 session lock）。所以在消息阶段取好，暂存在 `self._pending[id(event)]`，注入时 `pop` 掉。
+
+`id(event)` 作键在注入后会立刻清理，正常情况下不会泄漏；极端情况下某条消息没走到 LLM 请求，会残留一条，属于可接受的小泄漏。
+
+### 为什么附图优先原文配图
+
+转发场景下原文图才是主体（转发者往往不配图）。`_build_payload` 按 `[原文图, 外层图]` 顺序取，外层额度用完就停。
+
+## 两个必须知道的 AstrBot 陷阱
+
+这两个都是实际踩到的，改动 `main.py` 时务必保持现状。
+
+### 1. `event_message_type` / `platform_adapter_type` 在 `on_llm_request` 上无效
+
+它们注册进 `md.event_filters`，而 `event_filters` **只在 AdapterMessageEvent 路径上被求值**，`call_event_hook` 根本不读。所以：
+
+```python
+@filter.on_llm_request()
+async def inject_qzone_content(self, event, req):
+    ...
+    if not self._platform_ok(event):   # ← 必须手动门禁
+        return
+```
+
+给 `on_llm_request` 加 `@filter.platform_adapter_type(...)` 是**静默失效**的，不会报错，只会让其他平台也吃到注入。
+
+### 2. `on_llm_request` 里不能调 `stop_event()`
+
+`internal.py` 里 `call_event_hook(OnLLMRequestEvent, req)` 返回真值就直接 `return`，runner 不启动；而 `_save_to_history` 又被 `not event.is_stopped()` 把着。结果是**本轮消息完全不落历史**，注入的内容也就丢了。
+
+正确做法：注入后正常返回。
+
+若确实想阻止默认的 LLM 请求，用 `event.should_call_llm(True)` —— 注意这个方法名字反直觉，它设置的是 `event.call_llm` 标志，而消费处写的是 `not event.call_llm`：
+
+```python
+# core/pipeline/process_stage/stage.py:56-60
+if (not event._has_send_oper
+        and event.is_at_or_wake_command
+        and not event.call_llm):
+    ...  # 走默认 LLM 链路
+```
+
+所以 `should_call_llm(True)` 是**跳过**默认 LLM 请求，`should_call_llm(False)` 才是允许。它只影响 AstrBot 默认链路，不影响插件自己发起的 LLM 请求。
+
+### 另外两点
+
+- `Comp.Json.data` 已经是 `json.loads` 过的 dict，不要再解一次。
+- 适配器**没有** `Ark`/`LightApp` 组件，`"ark"` 不在 `ComponentTypes` 里，这类消息段会被丢弃并打警告 —— 所以 `_find_share_url` 留了 `raw_message` 兜底。
+
+## 测试
+
+`test_core.py` 是**自包含**的：不装 AstrBot、不联网，用桩模块注入 `astrbot.api` / `aiohttp` 后加载真实插件代码。
+
+```bash
+cd astrbot_plugin_qzone_reader
+python test_core.py
+```
+
+当前 **111 项断言**。分段：
+
+| 段 | 覆盖 |
+| --- | --- |
+| `[1]`–`[3]` | 卡片链接提取、参数解析、Cookie 与 `g_tk` |
+| `[4]`–`[6]` | jsonp 解析、feed 字段映射、文本渲染 |
+| `[7]` | Cookie 缓存 TTL |
+| `[8]` `[8b]` `[8c]` | 说说定位、短链参数识别、**认不出时必须放弃**（安全回归） |
+| `[8d]` | **转发：必须读到原文**，且不重复渲染 |
+| `[9]`–`[13]` | 插件组装、白名单、卡片识别、转义还原、平台门禁 |
+| `[14]`–`[15]` | 登录态失效检测与自动重取 |
+
+### fixture
+
+`tests/fixtures/repost_cell.json` 是一条真实转发说说的**脱敏**数据（昵称已抹掉，QQ 号保留，结构与线上一致）。它用于 `[8d]` 段，覆盖分享页解析 → cell 转换 → 渲染的完整链路。
+
+`test_core.py` 会用 `json.dumps` 把它包成 JS 对象字面量的形式，以复刻真实页面：
+
+```python
+html = (
+    "<html><script>var FrontPage = {\n"
+    " loginUin : 'NaN', // 页面注释\n"
+    ' module : "detail",\n'
+    f" data : {cell_json}\n"
+    "};</script></html>"
+)
+```
+
+改动 `frontpage.py` 或 `_post_from_cell` 时，务必保证 `[8d]` 全绿。
+
+## 调试
+
+日志前缀统一 `[qzone_reader]`：
+
+```bash
+grep qzone_reader /AstrBot/data/logs/astrbot.log
+```
+
+关键日志与含义：
+
+| 日志 | 含义 |
+| --- | --- |
+| `检测到 QQ空间分享，开始读取: <url>` | 链接识别成功 |
+| `使用 <source> 提供的 QQ空间登录态` | 登录态就位 |
+| `分享短链已解析为: <url>` | 302 解析成功 |
+| `这是一条转发：原作者 X（QQ N），已连同原文一起读取` | 转发两层都拿到 |
+| `分享页没取到内容，改走动态列表接口兜底` | 分享页无数据 |
+| `在 uin=X 的动态里没找到该条说说（cellid=Y），放弃` | 列表接口也定位不到 |
+| `分享链接里没有可用的说说定位参数，放弃读取` | 参数不足，安全放弃 |
+| `没有可用的 QQ空间登录态` | 登录态获取失败 |
+
+### 排查分享页解析
+
+遇到解析问题时，保存一份真实响应再离线调试：
+
+```bash
+curl -sL -o share.html \
+  -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36' \
+  'https://h5.qzone.qq.com/ugc/share/?<参数>'
+```
+
+```python
+import pathlib
+from core import frontpage
+html = pathlib.Path("share.html").read_text(encoding="utf-8", errors="replace")
+cell = frontpage.extract_share_post(html)
+print(cell.keys() if cell else "解析失败")
+```
+
+解析失败时按顺序检查：`FrontPage` 字样在不在 → `_balanced_object` 有没有切错 → `data` 字段有没有取到 → 是不是被重定向到登录页。
+
+## 扩展指引
+
+### 支持新的分享链接形态
+
+1. 在 `_looks_like_share()` 加上 URL 特征；
+2. 若该形态需要额外解析步骤，在 `_resolve_share()` 里补；
+3. 在 `_share_page_candidates()` 加候选地址；
+4. 加对应的 `_extract_host_uin` 字段（如果有新的 uin 字段名）；
+5. 在 `test_core.py` `[1]`/`[2]`/`[8b]` 段补断言。
+
+### 支持新的内容字段（如长文、音乐、位置）
+
+1. 在 `frontpage.py` 加 `cell_xxx()` 纯函数；
+2. 在 `_post_from_cell()` 里填进 `QzonePost`；
+3. 在 `QzonePost.to_prompt()` 里渲染；
+4. 补测试。
+
+`to_prompt()` 是唯一面向模型的渲染出口，改动时注意别破坏转发两层的结构 —— `[8d]` 里有一条「原文正文不重复出现」的断言，就是防这个的。
+
+### 加配置项
+
+三处都要改，缺一个就会出现「配置里有但代码不读」的假开关：
+
+1. `_conf_schema.json` 加字段；
+2. `main.py` 里 `self.config.get(...)` 读取；
+3. 需要的话补 README 配置表。
+
+## 已知脆弱点
+
+| 位置 | 风险 |
+| --- | --- |
+| `frontpage.py` 的括号配平解析 | 腾讯改分享页结构或改用标准 JSON 时会失效。换成 `json.loads` 是升级方向 |
+| `photourl` 的尺寸键 | `"0"`/`"1"`/`"11"` 等键含义未证实，现按面积挑最大，属于启发式 |
+| `_pick_feed` 的时间戳兜底 | 分享页路径失效、退回列表接口时才用到，窗口 ±120 秒，可能误匹配 |
+| `AUTH_ERROR_CODES` | 只收了 `-3000`/`-10000`/`-4001`，其他失效码会走普通异常路径（不重取登录态） |
+| `id(event)` 作暂存键 | 极端情况下未走到 LLM 请求的消息会残留一条暂存 |
+| 分享页可能返回登录页 | 此时 `FrontPage` 仍在但 `data` 为空，会落到列表接口兜底 |
+| 视频 | 只记录数量，未解析。`cell_video()` 已能取地址，但未接入注入 |
