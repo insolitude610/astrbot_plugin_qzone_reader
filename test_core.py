@@ -440,6 +440,30 @@ def main() -> int:
     plain_text = plugin._with_instruction("BODY", "off")
     check("off 模式只留原文", plain_text == "BODY")
 
+    # 叙述规范：两种模式都要带上，否则模型会用第一人称代入作者
+    for mode, label in (("brief", "brief"), ("full", "full")):
+        t = plugin._with_instruction("BODY", mode)
+        check(f"{label} 模式带叙述规范标题", "叙述规范" in t)
+        check(f"{label} 模式要求第三人称", "第三人称叙述" in t)
+        check(
+            f"{label} 模式禁止第一人称代入",
+            "不要用第一人称代入任何一方" in t,
+        )
+        check(f"{label} 模式给出反例", "不要写「我 3 月 6 日进群」" in t)
+        check(f"{label} 模式给出正确写法", "作者称他 3 月 6 日进群" in t)
+        check(
+            f"{label} 模式要求归纳而非缩写",
+            "不是把原文缩写一遍" in t,
+        )
+    check(
+        "off 模式不带叙述规范（不注入任何指令）",
+        "叙述规范" not in plain_text,
+    )
+    check(
+        "叙述规范排在正文之前（先立规矩）",
+        text.index("叙述规范") < text.index("测试内容"),
+    )
+
     full_text = plugin._with_instruction("BODY", "full")
     check("full 模式要求完整总结", "完整地总结" in full_text and "BODY" in full_text)
     for kw in ("来龙去脉", "作者的情绪", "配图", "信息不完整"):
@@ -447,6 +471,16 @@ def main() -> int:
     check(
         "full 不再是「先简要总结」那种聊两句的指令",
         "请先简要总结" not in full_text,
+    )
+    # 这句曾被模型理解成「用说话人的口吻」，导致整篇第一人称自述
+    check(
+        "已移除会导致第一人称代入的「用你平时说话的口吻」",
+        "用你平时说话的口吻" not in full_text,
+        "旧措辞会让模型代入作者视角",
+    )
+    check(
+        "off 模式不含旧措辞",
+        "用你平时说话的口吻" not in plugin._with_instruction("BODY", "off"),
     )
 
     # 逐图对应：用户要求总结里点明「正文哪部分 ↔ 第几张图」
