@@ -123,7 +123,10 @@ fetch_post(creds, share_url)
 | `_card_text(event)` | 取卡片自带的标题/摘要，作为降级内容 |
 | `_in_scope(event)` | 会话白名单判断 |
 | `_summarize_mode()` | 解析 `summarize_mode`，返回 `off` / `brief` / `full`；兼容旧键 `auto_summarize`，非法值回退 `brief` |
+| `_keep_in_context()` | 解析 `context_mode`，`keep` 返回 `True`，`once` 返回 `False` |
 | `_with_instruction(body, mode)` | 按模式决定是否给正文加指令前缀 |
+| `_append_extra_part(req, text, persist)` | 注入文本块；`persist=False` 时标记 `mark_as_temp()` |
+| `_append_image_part(req, url)` | 以**临时** `ImageURLPart` 注入图片，避免落历史 |
 | `_append_extra_part(req, text)` | 注入文本块，优先 `TextPart`，取不到退回 dict |
 
 模块级常量：
@@ -339,6 +342,50 @@ orglikekey : http://user.qzone.qq.com/<原作者uin>/mood/<原cellid>
 
 转发场景下原文图才是主体（转发者往往不配图）。`_build_payload` 按 `[原文图, 外层图]` 顺序取，外层额度用完就停。
 
+### `context_mode` 的实现机制与边界
+
+AstrBot 的持久化开关只有 `ContentPart.mark_as_temp()`（置 `_no_save=True`），
+落历史时由 `dump_messages_with_checkpoints()` 过滤：
+
+```python
+# core/agent/message.py:350-355
+message_data["content"] = [
+    part.model_dump()
+    for part in message.content
+    if not getattr(part, "_no_save", False)   # ← 临时 part 在这里被丢掉
+]
+```
+
+据此 `context_mode` 分两条路：
+
+| 模式 | 文本 | 图片 |
+| --- | --- | --- |
+| `keep` | 普通 `TextPart` → 落库 | 追加到 `req.image_urls` → 落库（base64） |
+| `once` | `TextPart.mark_as_temp()` | 临时 `ImageURLPart` 塞进 `extra_user_content_parts` |
+
+**图片为什么不能走 `req.image_urls`**：`assemble_context()` 把 `image_urls`
+转成 `image_url` 内容块时**不带 `_no_save`**（`provider/entities.py:251-273`），
+所以一旦进了那个字段就必然落库。要让它不持久化，只能改走
+`extra_user_content_parts` 里的临时 `ImageURLPart` ——
+`assemble_context()` 同样会解析该字段里的图片（`entities.py:220-248`），
+所以对模型的效果一样，但能被过滤掉。
+
+`ImageURLPart` 的构造参数**必须是 dict**（`{'url': ...}`），传字符串会
+`ValidationError`：
+
+```python
+ImageURLPart(image_url={'url': url})          # ✅
+ImageURLPart(image_url=url)                   # ❌ ValidationError
+```
+
+三条无法绕过的边界，已写进 README：
+
+1. **用户那条卡片消息由 AstrBot 自己入库**（`persist_group_message` / 会话管理器），
+   插件无法阻止它落库，`once` 模式下它会以空壳卡片形式留在历史里。
+2. **bot 的回复照常落库**，`context_mode` 只管说说内容。
+3. `Message._no_save` 能整条消息不落库，但那是 `Message` 层级的属性，
+   而用户消息不是插件构造的，改不到。
+
 ## 两个必须知道的 AstrBot 陷阱
 
 这两个都是实际踩到的，改动 `main.py` 时务必保持现状。
@@ -402,6 +449,8 @@ python test_core.py
 | `[14]`–`[15]` | 登录态失效检测与自动重取 |
 | `[16]` | **长截图切片**：尺寸判定、切片尺寸、预算约束、降级路径 |
 | `[17]` | 配置项接线（含「已移除硬上限」的断言） |
+| `[18]` | **上下文保留**：两种模式的临时标记、落历史过滤、非法值回退 |
+| `[19]` | 注入流程按 `context_mode` 分流（图片走哪个字段） |
 
 > **写测试桩时注意**：`fetch_bytes` 和 `_get_html` 都会读 `resp.status`，桩必须提供该属性。早期漏了它，导致 `status >= 400` 抛 `AttributeError` 被兜底 `except` 吞掉，表现为「图片莫名退回原 URL」——排查了好一阵。
 

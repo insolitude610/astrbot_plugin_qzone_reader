@@ -804,6 +804,96 @@ def main() -> int:
     )
     check("已移除隐藏硬上限 HARD_IMAGE_CAP", not hasattr(main_mod, "HARD_IMAGE_CAP"))
 
+    print("\n[18] 上下文保留模式 context_mode")
+    from astrbot.core.agent.message import TextPart as _TextPart, ImageURLPart as _ImgPart
+
+    p_keep = make_plugin(main_mod, api, {"context_mode": "keep"})
+    p_once = make_plugin(main_mod, api, {"context_mode": "once"})
+    p_default = make_plugin(main_mod, api, {})
+
+    check("keep 模式保留上下文", p_keep._keep_in_context() is True)
+    check("once 模式不保留上下文", p_once._keep_in_context() is False)
+    check("默认（未配置）为保留", p_default._keep_in_context() is True)
+    check(
+        "大小写与空格容错",
+        make_plugin(main_mod, api, {"context_mode": "  ONCE "})._keep_in_context() is False,
+    )
+    check(
+        "非法值回退为 keep",
+        make_plugin(main_mod, api, {"context_mode": "bogus"})._keep_in_context() is True,
+    )
+
+    class _Req:
+        def __init__(self):
+            self.extra_user_content_parts = []
+            self.image_urls = []
+
+    # keep：持久 part（不带 _no_save），图片走 image_urls
+    r1 = _Req()
+    main_mod.QzoneReaderPlugin._append_extra_part(r1, "说说原文", persist=True)
+    check("keep：文本 part 可持久化", r1.extra_user_content_parts[0]._no_save is False)
+
+    # once：临时 part，落历史时会被过滤
+    r2 = _Req()
+    main_mod.QzoneReaderPlugin._append_extra_part(r2, "说说原文", persist=False)
+    check("once：文本 part 标记临时", r2.extra_user_content_parts[0]._no_save is True)
+    check(
+        "临时 part 的 dump 带 _no_save",
+        r2.extra_user_content_parts[0].model_dump().get("_no_save") is True,
+    )
+
+    main_mod.QzoneReaderPlugin._append_image_part(r2, "https://x/1.jpg")
+    check("once：图片进入 extra_user_content_parts", len(r2.extra_user_content_parts) == 2)
+    img_part = r2.extra_user_content_parts[1]
+    check("once：图片 part 类型为 image_url", getattr(img_part, "type", "") == "image_url")
+    check("once：图片 part 标记临时", img_part._no_save is True)
+    check(
+        "once：图片 url 正确",
+        img_part.image_url.get("url") == "https://x/1.jpg",
+        str(img_part.image_url),
+    )
+    check("once：不动用 req.image_urls（那个字段会落库）", r2.image_urls == [])
+
+    # 端到端：模拟落历史时的过滤（复刻 message.py 的 dump 逻辑）
+    def dump_saved(parts):
+        return [p.model_dump() for p in parts if not getattr(p, "_no_save", False)]
+
+    kept = dump_saved(r1.extra_user_content_parts)
+    dropped = dump_saved(r2.extra_user_content_parts)
+    check("keep：落历史保留说说文本", any("说说原文" in str(x.get("text", "")) for x in kept))
+    check("once：落历史不保留说说文本", not any("说说原文" in str(x.get("text", "")) for x in dropped))
+    check("once：落历史不保留图片", not any(x.get("type") == "image_url" for x in dropped))
+    check("once：落历史后确实清空", dropped == [], str(dropped))
+
+    print("\n[19] 注入流程按 context_mode 分流")
+    plugin_m = make_plugin(main_mod, api, {"context_mode": "keep"})
+
+    class _Ev:
+        pass
+
+    ev_keep = _Ev()
+    plugin_m._pending[id(ev_keep)] = ("说说文本", ["https://x/a.jpg", "https://x/b.jpg"])
+    req_k = _Req()
+    asyncio.run(plugin_m.inject_qzone_content(ev_keep, req_k))
+    check("keep：图片进 req.image_urls", len(req_k.image_urls) == 2, str(req_k.image_urls))
+    check("keep：图片不进 extra parts", len(req_k.extra_user_content_parts) == 1)
+
+    plugin_o = make_plugin(main_mod, api, {"context_mode": "once"})
+    ev_once = _Ev()
+    plugin_o._pending[id(ev_once)] = ("说说文本", ["https://x/a.jpg", "https://x/b.jpg"])
+    req_o = _Req()
+    asyncio.run(plugin_o.inject_qzone_content(ev_once, req_o))
+    check("once：图片不进 req.image_urls", req_o.image_urls == [], str(req_o.image_urls))
+    check(
+        "once：文本 + 两张图共 3 个临时 part",
+        len(req_o.extra_user_content_parts) == 3,
+        str(len(req_o.extra_user_content_parts)),
+    )
+    check(
+        "once：全部 part 都是临时的",
+        all(getattr(x, "_no_save", False) for x in req_o.extra_user_content_parts),
+    )
+
     print("\n" + "=" * 56)
     print(f"通过 {passed} 项，失败 {len(failed)} 项")
     if failed:
@@ -889,6 +979,53 @@ def load_main_module():
     components_mod.Plain = Plain
     components_mod.Json = Json
     sys.modules["astrbot.core.message.components"] = components_mod
+
+    # 桩：模拟 astrbot.core.agent.message 的 TextPart / ImageURLPart
+    # 真实类支持 mark_as_temp() 置 _no_save，落历史时会被过滤
+    agent_msg_mod = types.ModuleType("astrbot.core.agent.message")
+
+    class _ContentPart:
+        def __init__(self, **kw):
+            self._no_save = False
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+        def mark_as_temp(self):
+            self._no_save = True
+            return self
+
+        def model_dump(self):
+            data = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+            if self._no_save:
+                data["_no_save"] = True
+            return data
+
+    class TextPart(_ContentPart):
+        type = "text"
+
+        def __init__(self, text=""):
+            super().__init__(text=text)
+
+    class ImageURLPart(_ContentPart):
+        type = "image_url"
+
+        def __init__(self, image_url=None):
+            if not isinstance(image_url, dict):
+                raise ValueError("image_url 必须是 dict")
+            super().__init__(image_url=image_url)
+
+    agent_msg_mod.TextPart = TextPart
+    agent_msg_mod.ImageURLPart = ImageURLPart
+    # from astrbot.core.agent.message import X 需要父子包都在 sys.modules 里
+    agent_pkg = types.ModuleType("astrbot.core.agent")
+    agent_pkg.__path__ = []  # type: ignore[attr-defined]
+    agent_pkg.message = agent_msg_mod  # type: ignore[attr-defined]
+    core_pkg_stub = types.ModuleType("astrbot.core")
+    core_pkg_stub.__path__ = []  # type: ignore[attr-defined]
+    core_pkg_stub.agent = agent_pkg  # type: ignore[attr-defined]
+    sys.modules["astrbot.core"] = core_pkg_stub
+    sys.modules["astrbot.core.agent"] = agent_pkg
+    sys.modules["astrbot.core.agent.message"] = agent_msg_mod
 
     core_mod = types.ModuleType("astrbot.core")
     core_mod.__path__ = []  # type: ignore[attr-defined]

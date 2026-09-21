@@ -94,11 +94,17 @@ class QzoneReaderPlugin(Star):
         if not self._platform_ok(event):
             return
         text, images = payload
+        keep = self._keep_in_context()
 
         try:
-            self._append_extra_part(req, text)
+            self._append_extra_part(req, text, persist=keep)
             for url in images:
-                req.image_urls.append(url)
+                if keep:
+                    # 走 image_urls；AstrBot 会把图一并写入历史
+                    req.image_urls.append(url)
+                else:
+                    # 走临时图片 part；落历史时会被过滤掉，图片不会残留
+                    self._append_image_part(req, url)
         except Exception as exc:  # noqa: BLE001 - 注入失败不应打断对话
             logger.warning("[qzone_reader] 注入说说内容失败: %s", exc)
 
@@ -214,6 +220,15 @@ class QzoneReaderPlugin(Star):
             logger.warning("[qzone_reader] 重取登录态后仍失败: %s", exc)
             return None
 
+    def _keep_in_context(self) -> bool:
+        """是否把说说内容写入会话历史。
+
+        keep（默认）：注入的内容随本轮消息落库，之后可以继续追问。
+        once：只在本次回复时给模型看，不进历史 —— 用 mark_as_temp 实现。
+        """
+        mode = str(self.config.get("context_mode", "keep") or "keep").strip().lower()
+        return mode != "once"
+
     def _summarize_mode(self) -> str:
         """取总结模式：off / brief / full。
 
@@ -235,14 +250,38 @@ class QzoneReaderPlugin(Star):
         return body
 
     @staticmethod
-    def _append_extra_part(req: ProviderRequest, text: str) -> None:
-        """优先用 ContentPart 对象，取不到就退回等价 dict。"""
+    def _append_extra_part(req: ProviderRequest, text: str, *, persist: bool = True) -> None:
+        """把注入文本作为额外内容块追加。
+
+        persist=False 时标记为临时块，AstrBot 落历史时会把它过滤掉，
+        因此模型本次能看到，但不会留在后续上下文里。
+        """
         try:
             from astrbot.core.agent.message import TextPart
 
             part = TextPart(text=text)
+            if not persist:
+                part = part.mark_as_temp()
         except Exception:  # noqa: BLE001
             part = {"type": "text", "text": text}
+            if not persist:
+                # dict 形式下用同样的约定键，落历史时会被识别
+                part["_no_save"] = True
+        req.extra_user_content_parts.append(part)
+
+    @staticmethod
+    def _append_image_part(req: ProviderRequest, url: str) -> None:
+        """以临时图片块的形式附上一张图，避免它被写进会话历史。
+
+        req.image_urls 里的图会被 AstrBot 一并落库（以 base64 形式），
+        所以 context_mode=once 时必须走 extra_user_content_parts。
+        """
+        try:
+            from astrbot.core.agent.message import ImageURLPart
+
+            part = ImageURLPart(image_url={"url": url}).mark_as_temp()
+        except Exception:  # noqa: BLE001
+            part = {"type": "image_url", "image_url": {"url": url}, "_no_save": True}
         req.extra_user_content_parts.append(part)
 
     # ------------------------------------------------------------ 登录态来源

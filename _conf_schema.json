@@ -42,6 +42,13 @@
     "hint": "每片的目标最大高度（像素），仅在上方切片开启时生效。留 0 使用默认值 1280。调小可提高清晰度但会增加片数。",
     "default": 0
   },
+  "context_mode": {
+    "description": "上下文保留",
+    "type": "string",
+    "hint": "keep：说说内容随本轮消息写入会话历史，之后可以继续追问讨论（默认）。once：只在本次回复时给模型看，不进历史 —— 适合「看一眼就完事」的内容，避免长瓜条长期占用上下文；本次回复本身仍会保存在历史里。注意：你发的那条卡片消息由 AstrBot 自行入库，本插件无法控制。",
+    "options": ["keep", "once"],
+    "default": "keep"
+  },
   "summarize_mode": {
     "description": "总结模式",
     "type": "string",
