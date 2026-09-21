@@ -802,6 +802,32 @@ def main() -> int:
         )
         check("max_width=0 时不缩放，原样返回", out3c == ["http://x/n.jpg"], str(out3c))
 
+        # 等比缩放：宽度截到上限，高度按同比例缩，不能只改宽
+        def scaled_size(w, h, cap=1024):
+            enc = iu.encode_plain(make_image(w, h), max_width=cap)
+            if enc is None:
+                return (w, h)
+            raw = _b64.b64decode(enc.split(",", 1)[1])
+            with _PILImage.open(_io.BytesIO(raw)) as s:
+                return s.size
+
+        w2, h2 = scaled_size(1280, 960)
+        check("等比缩放：宽度截到上限", w2 == 1024, f"{w2}x{h2}")
+        check("等比缩放：高度按比例缩（不是不动）", h2 == 768, f"{w2}x{h2}")
+        check(
+            "等比缩放：宽高比保持不变",
+            abs((h2 / w2) - (960 / 1280)) < 0.01,
+            f"{h2 / w2:.3f} vs {960 / 1280:.3f}",
+        )
+
+        w3, h3 = scaled_size(1184, 1280)
+        check("高瘦图同样保持等比", w3 == 1024 and abs((h3 / w3) - (1280 / 1184)) < 0.01, f"{w3}x{h3}")
+
+        # 未超上限的图不做任何处理
+        check("640 宽长图不受宽度限制影响", iu.encode_plain(make_image(640, 3799)) is None)
+        check("正好等于上限时不缩放", iu.encode_plain(make_image(1024, 900)) is None)
+        check("窄图不缩放", iu.encode_plain(make_image(600, 500)) is None)
+
         sess4 = _Session(b"broken")
         out4 = asyncio.run(
             iu.prepare_images(sess4, ["http://x/b.jpg"], budget=4, slice_tall=True)

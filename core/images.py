@@ -287,11 +287,20 @@ async def prepare_images(
 
         chosen = pieces[:room]
         result.extend(chosen)
+        # 按「宽度缩放后、切片前」的尺寸报告。
+        # 报原始尺寸会与实际片数对不上；报缩放后总高度又会被误读成单片高度。
+        capped_w = min(size[0], max_width) if max_width and max_width > 0 else size[0]
+        capped_h = (
+            max(int(size[1] * capped_w / size[0]), 1) if capped_w != size[0] else size[1]
+        )
+        note = f"（原 {size[0]}x{size[1]}）" if capped_w != size[0] else ""
         logger.info(
-            "[qzone_reader] 长图 %sx%s 切成 %d 片（取 %d 片，剩余额度 %d）",
-            size[0],
-            size[1],
+            "[qzone_reader] 长图 %sx%s%s 切成 %d 片（每片高约 %s，取 %d 片，剩余额度 %d）",
+            capped_w,
+            capped_h,
+            note,
             len(pieces),
+            min(slice_height, capped_h),
             len(chosen),
             room,
         )

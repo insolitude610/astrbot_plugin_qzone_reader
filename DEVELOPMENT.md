@@ -1,4 +1,4 @@
-# 开发文档
+﻿# 开发文档
 
 面向维护者。用户使用说明见 [README.md](README.md)。
 
@@ -249,9 +249,17 @@ fetch_post(creds, share_url)
 
 | 函数 | 说明 |
 | --- | --- |
-| `downscale_if_wide(im, max_width)` | 宽度超上限时等比缩小（多数模型把长边压到约 1024，超出部分是浪费） |
+| `downscale_if_wide(im, max_width)` | 宽度超上限时**等比**缩小。高度按 `height * max_width / width` 同比例算，只改宽会拉变形 |
 | `encode_plain(data, quality, max_width)` | 超宽普通图缩放并编码成 data URL；无需缩放时返回 `None` |
 | `_encode(im, quality)` | 统一的 JPEG → data URL 编码出口 |
+
+`image_max_width` 的作用范围值得记清：它对**所有**候选图生效（不只长截图），
+但只有宽度超过上限的才会被处理。瓜条里常见的 640 宽长截图不会被动到，
+受影响的只是本身很宽的图（如 1280×960、1184×1280）。
+
+日志按「宽度缩放后、切片前」的尺寸报告。早期版本报的是**原始尺寸**，
+与实际片数对不上；改成只报缩放后尺寸又会被误读成单片高度 ——
+现在两者都写，例如 `长图 1024x1107（原 1184x1280）切成 1 片（每片高约 1107，...）`。
 
 设计要点：
 
@@ -561,7 +569,7 @@ cd astrbot_plugin_qzone_reader
 python test_core.py
 ```
 
-当前 **196 项断言**。分段：
+当前 **203 项断言**。分段：
 
 | 段 | 覆盖 |
 | --- | --- |
