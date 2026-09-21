@@ -392,12 +392,42 @@ def main() -> int:
 
     print("\n[9] 插件组装逻辑（注入文本 + 图片裁剪）")
     main_mod = load_main_module()
-    plugin = make_plugin(main_mod, api, {"auto_summarize": True})
+    plugin = make_plugin(main_mod, api, {"summarize_mode": "brief"})
 
-    text = plugin._with_instruction("【QQ空间说说原文】\n正文：\n测试内容", True)
-    check("开启自动总结时附带总结指令", "请先简要总结" in text and "测试内容" in text)
-    plain_text = plugin._with_instruction("BODY", False)
-    check("关闭自动总结时只留原文", plain_text == "BODY")
+    text = plugin._with_instruction("【QQ空间说说原文】\n正文：\n测试内容", "brief")
+    check("brief 模式附带要点总结指令", "请先简要总结" in text and "测试内容" in text)
+    plain_text = plugin._with_instruction("BODY", "off")
+    check("off 模式只留原文", plain_text == "BODY")
+
+    full_text = plugin._with_instruction("BODY", "full")
+    check("full 模式要求完整总结", "完整地总结" in full_text and "BODY" in full_text)
+    for kw in ("来龙去脉", "作者的情绪", "配图", "信息不完整"):
+        check(f"full 模式覆盖「{kw}」", kw in full_text)
+    check(
+        "full 不再是「先简要总结」那种聊两句的指令",
+        "请先简要总结" not in full_text,
+    )
+    check(
+        "三种模式长度递增",
+        len(plain_text) < len(text) < len(full_text),
+        f"{len(plain_text)} / {len(text)} / {len(full_text)}",
+    )
+
+    # 模式解析：含旧键兼容与非法值回退
+    def mode_of(cfg):
+        return make_plugin(main_mod, api, cfg)._summarize_mode()
+
+    check("默认（无配置）为 brief", mode_of({}) == "brief")
+    check("显式 off", mode_of({"summarize_mode": "off"}) == "off")
+    check("显式 full", mode_of({"summarize_mode": "full"}) == "full")
+    check("大小写与空格容错", mode_of({"summarize_mode": "  FULL "}) == "full")
+    check("非法值回退 brief", mode_of({"summarize_mode": "bogus"}) == "brief")
+    check("兼容旧键 auto_summarize=True → brief", mode_of({"auto_summarize": True}) == "brief")
+    check("兼容旧键 auto_summarize=False → off", mode_of({"auto_summarize": False}) == "off")
+    check(
+        "新键优先于旧键",
+        mode_of({"summarize_mode": "full", "auto_summarize": False}) == "full",
+    )
 
     # extra_user_content_parts 注入：没有 ContentPart 类时应退回 dict
     class FakeReq:

@@ -27,10 +27,24 @@ from .core.qzone_api import (
 # 一次注入里附带的图片上限，防止把模型上下文撑爆
 HARD_IMAGE_CAP = 9
 
-SUMMARIZE_INSTRUCTION = (
+# summarize_mode = brief：要点式总结后自然接话（默认，最省）
+BRIEF_SUMMARY_INSTRUCTION = (
     "用户转发了一条 QQ空间说说，上面的【QQ空间说说原文】就是该说说的内容。\n"
     "请先简要总结这条说说讲了什么（作者的表达、情绪或重点），"
     "然后用自然的口吻回应；用户接下来可能会继续追问或和你讨论这条说说。"
+)
+
+# summarize_mode = full：以总结为主体，完整讲清楚
+FULL_SUMMARY_INSTRUCTION = (
+    "用户转发了一条 QQ空间说说，上面的【QQ空间说说原文】就是该说说的内容。\n"
+    "请完整地总结这条说说，用你平时说话的口吻，但内容要讲全：\n"
+    "1. 谁说给谁听的、发布与转发的时间；\n"
+    "2. 事情的来龙去脉，按条理把要点讲清楚；\n"
+    "3. 涉及哪些人或方，各自的主张与立场；\n"
+    "4. 作者的情绪与意图；\n"
+    "5. 若有配图，说明图片内容与正文的关系；\n"
+    "6. 信息不完整或属于单方说法的地方，明确指出来，不要替作者补全。\n"
+    "总结之后可以简短说一句你的看法，但总结本身要完整。"
 )
 
 FAILURE_HINT = (
@@ -94,7 +108,7 @@ class QzoneReaderPlugin(Star):
     ) -> tuple[str, list[str]]:
         """拉取说说内容并渲染成待注入的文本与图片列表。"""
         max_images = max(int(self.config.get("max_images", 4) or 0), 0)
-        auto_summary = bool(self.config.get("auto_summarize", True))
+        mode = self._summarize_mode()
         notify = bool(self.config.get("notify_on_failure", True))
 
         post = None
@@ -118,7 +132,7 @@ class QzoneReaderPlugin(Star):
                 else:
                     # 明确要求别声张，避免每张卡片都回一句"没读到"
                     body = f"{fallback}\n\n（请直接基于上面的文字回应，不要提及读取失败。）"
-                return self._with_instruction(body, auto_summary), []
+                return self._with_instruction(body, mode), []
             if not notify:
                 return "", []
             return FAILURE_HINT, []
@@ -134,7 +148,7 @@ class QzoneReaderPlugin(Star):
                     break
 
         body = post.to_prompt(max_images=len(images))
-        return self._with_instruction(body, auto_summary), images
+        return self._with_instruction(body, mode), images
 
     async def _fetch_with_retry(
         self, event: AstrMessageEvent, creds: QzoneCredentials, share_url: str
@@ -158,11 +172,25 @@ class QzoneReaderPlugin(Star):
             logger.warning("[qzone_reader] 重取登录态后仍失败: %s", exc)
             return None
 
+    def _summarize_mode(self) -> str:
+        """取总结模式：off / brief / full。
+
+        同时兼容旧键 auto_summarize（布尔），便于已装的配置平滑迁移。
+        """
+        raw = self.config.get("summarize_mode")
+        if raw is None:
+            return "brief" if self.config.get("auto_summarize", True) else "off"
+        mode = str(raw).strip().lower()
+        return mode if mode in {"off", "brief", "full"} else "brief"
+
     @staticmethod
-    def _with_instruction(body: str, auto_summary: bool) -> str:
-        if not auto_summary:
-            return body
-        return f"{SUMMARIZE_INSTRUCTION}\n\n{body}"
+    def _with_instruction(body: str, mode: str) -> str:
+        """按总结模式决定是否给正文加上指令前缀。"""
+        if mode == "full":
+            return f"{FULL_SUMMARY_INSTRUCTION}\n\n{body}"
+        if mode == "brief":
+            return f"{BRIEF_SUMMARY_INSTRUCTION}\n\n{body}"
+        return body
 
     @staticmethod
     def _append_extra_part(req: ProviderRequest, text: str) -> None:

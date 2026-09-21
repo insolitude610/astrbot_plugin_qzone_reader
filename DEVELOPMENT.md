@@ -119,7 +119,8 @@ fetch_post(creds, share_url)
 | `_find_share_url(event)` | 从消息链找分享链接 |
 | `_card_text(event)` | 取卡片自带的标题/摘要，作为降级内容 |
 | `_in_scope(event)` | 会话白名单判断 |
-| `_with_instruction(body, auto_summary)` | 按配置附加/不附加总结指令 |
+| `_summarize_mode()` | 解析 `summarize_mode`，返回 `off` / `brief` / `full`；兼容旧键 `auto_summarize`，非法值回退 `brief` |
+| `_with_instruction(body, mode)` | 按模式决定是否给正文加指令前缀 |
 | `_append_extra_part(req, text)` | 注入文本块，优先 `TextPart`，取不到退回 dict |
 
 模块级常量：
@@ -127,8 +128,25 @@ fetch_post(creds, share_url)
 | 常量 | 说明 |
 | --- | --- |
 | `HARD_IMAGE_CAP = 9` | 图片数硬上限，防止上下文被撑爆 |
-| `SUMMARIZE_INSTRUCTION` | 自动总结指令 |
+| `BRIEF_SUMMARY_INSTRUCTION` | `summarize_mode=brief` 的指令：要点式总结后自然接话 |
+| `FULL_SUMMARY_INSTRUCTION` | `summarize_mode=full` 的指令：以完整总结为主体，6 条要点清单 |
 | `FAILURE_HINT` | 读取失败时给模型的提示，明确要求「不要编造」 |
+
+### 总结模式与指令
+
+`summarize_mode` 是唯一影响「bot 怎么回应」的配置，三档对应三种指令注入策略：
+
+| 值 | `_with_instruction` 行为 |
+| --- | --- |
+| `off` | 原样返回正文，不加任何前缀 |
+| `brief` | 前缀 `BRIEF_SUMMARY_INSTRUCTION` |
+| `full` | 前缀 `FULL_SUMMARY_INSTRUCTION` |
+
+改动这两个指令常量时注意：
+
+- `full` 的第 6 条（要求指出信息不全、不要替作者补全）是**刻意加的约束**。瓜条类内容常是单方说法，去掉这条会让 bot 顺着原文情绪跑偏。
+- 三条路径产出的内容**都会进历史**（因为都作为 `extra_user_content_parts` 注入），改指令不会影响持久化。
+- `test_core.py` 的 `[9]` 段断言了 `full` 必须包含「完整地总结」「来龙去脉」「作者的情绪」「配图」「信息不完整」等关键词，改指令时同步改测试，否则会红。
 
 ### `core/qzone_api.py`
 

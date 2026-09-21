@@ -30,11 +30,12 @@
     "hint": "把说说配图交给多模态模型阅读。设为 0 表示不附带图片（适用于纯文本模型）。",
     "default": 4
   },
-  "auto_summarize": {
-    "description": "转发后自动总结",
-    "type": "bool",
-    "hint": "开启：在注入的内容前附一段指令，要求 bot 先总结说说再自然回应。关闭：只注入原文、不加任何指令，由模型自行决定怎么回（注意：这不代表 bot 不回复，是否回复仍由 AstrBot 的唤醒规则决定）。",
-    "default": true
+  "summarize_mode": {
+    "description": "总结模式",
+    "type": "string",
+    "hint": "off：不加任何指令，bot 按自己人格自由发挥（可能只聊一句）。brief：先要点式总结再自然接话，较省 token。full：明确要求 bot 用自己的人格把这条动态完整总结一遍（谁说的、来龙去脉、涉及哪些人、作者情绪、配图内容、哪里信息不全），总结之后可再补一句看法。",
+    "options": ["off", "brief", "full"],
+    "default": "brief"
   },
   "group_whitelist": {
     "description": "生效会话白名单",
