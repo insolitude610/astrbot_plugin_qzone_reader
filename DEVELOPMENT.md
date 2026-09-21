@@ -40,6 +40,8 @@ astrbot_plugin_qzone_reader/
 │   └── qzone_api.py           # 数据模型、链接识别、HTTP 调用、降级逻辑
 ├── tests/fixtures/
 │   └── repost_cell.json       # 脱敏后的转发说说数据，供回归测试用
+├── scripts/
+│   └── check_docs.py          # 文档一致性检查（见「测试」）
 ├── test_core.py               # 自测脚本（无 AstrBot 依赖，见「测试」）
 ├── _conf_schema.json          # 配置项定义
 └── metadata.yaml              # 插件元数据
@@ -480,6 +482,33 @@ python test_core.py
 | `[20]` | **群聊引用卡片**：`Reply.chain` 递归、嵌套引用、自引用保护、顶层优先 |
 
 > **写测试桩时注意**：`fetch_bytes` 和 `_get_html` 都会读 `resp.status`，桩必须提供该属性。早期漏了它，导致 `status >= 400` 抛 `AttributeError` 被兜底 `except` 吞掉，表现为「图片莫名退回原 URL」——排查了好一阵。
+
+### 文档一致性检查
+
+改完代码顺手跑一下，防止文档与现实脱节：
+
+```bash
+python scripts/check_docs.py
+```
+
+它核对这些事：
+
+| 检查 | 内容 |
+| --- | --- |
+| 1 | README 配置表的默认值是否与 `_conf_schema.json` 一致（带引号、大小写、`空` vs `[]` 等写法差异会归一化，不算不一致） |
+| 2 | schema 里每个键是否都被 `main.py` 真正读取（防「假开关」） |
+| 3 | `DEVELOPMENT.md` 声称的断言数与 `test_core.py` 里 `check()` 调用数是否相等 |
+| 4 | 文档引用的日志串是否与代码实际输出对得上（`<占位符>` 当通配处理） |
+| 5 | 已删除的概念是否被**重新定义/使用**（历史注记里提到旧名不算残留） |
+| 5b | 提到已删除概念时是否明确标注了「已移除」，否则会误导读者 |
+| 6 | `metadata.yaml` 的 `repo` 地址是否出现在 README 里 |
+
+退出码非 0 即表示有漂移。
+
+**这个脚本本身就是被现实教育出来的**：写文档过程中多次出现「代码改了、文档还写着旧链路」，
+以及检查器自身的误报（把 `"napcat"` 这种正确写法判为不一致、把历史注记判为残留）。
+判断规则因此分成两类——**只查真问题**（重定义、未读取、数量不符），
+**容忍合理写法**（引号、别名、历史注记）。
 
 ### fixture
 
