@@ -33,7 +33,7 @@
   "auto_summarize": {
     "description": "转发后自动总结",
     "type": "bool",
-    "hint": "开启后会在注入内容里附加一段总结指令，bot 收到转发即自动总结；关闭则只注入原文，等你提问。",
+    "hint": "开启：在注入的内容前附一段指令，要求 bot 先总结说说再自然回应。关闭：只注入原文、不加任何指令，由模型自行决定怎么回（注意：这不代表 bot 不回复，是否回复仍由 AstrBot 的唤醒规则决定）。",
     "default": true
   },
   "group_whitelist": {
