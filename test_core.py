@@ -224,8 +224,94 @@ def main() -> int:
         msglist, cell_id="", share_url="https://h5.qzone.qq.com/ugc/share?t=1699999000"
     )
     check("无 cellid 时按时间戳命中", by_time["cellid"] == "other", str(by_time))
-    check("都对不上时取第一条", api._pick_feed(msglist, cell_id="nope", share_url="")["cellid"] == "other")
+    # 关键回归：定位不到时必须放弃，绝不能随便挑一条
+    # （正是这个兜底导致把无关说说注入给了用户）
+    check(
+        "cellid 对不上时返回 None（不猜）",
+        api._pick_feed(msglist, cell_id="nope", share_url="") is None,
+    )
+    check(
+        "无任何定位信息时返回 None（不猜）",
+        api._pick_feed(msglist, cell_id="", share_url="https://mobile.qzone.qq.com/l?g=1502&i=x&u=1") is None,
+    )
     check("空列表返回 None", api._pick_feed([], cell_id="x", share_url="") is None)
+
+    print("\n[8b] 短链参数识别：u= / i= 不是 QQ 号，不能当 uin 用")
+    short = api.parse_share_url(
+        "https://mobile.qzone.qq.com/l?g=1502&i=a8cb295f29ebaf6a42240d00&u=1596574632&a=311&sharetag=X"
+    )
+    check("短链里解析出 i 和 u", short.get("i") == "a8cb295f29ebaf6a42240d00" and short.get("u") == "1596574632")
+    check(
+        "短链不被当成有定位信息",
+        api._has_feed_locator(short) is False,
+        str(api._extract_host_uin(short)),
+    )
+    check("短链推不出 host_uin", api._extract_host_uin(short) is None)
+
+    h5 = api.parse_share_url(
+        "https://h5.qzone.qq.com/ugc/share?res_uin=3237747236&cellid=abc&t=1700000000"
+    )
+    check("h5 分享页能推出 host_uin", api._extract_host_uin(h5) == 3237747236)
+    check("h5 分享页被判定有定位信息", api._has_feed_locator(h5) is True)
+    check("o 前缀 uin 可解析", api._extract_host_uin({"res_uin": "o3237747236"}) == 3237747236)
+    check("位数不合理的 uin 被拒", api._extract_host_uin({"res_uin": "123"}) is None)
+    check("非数字 uin 被拒", api._extract_host_uin({"res_uin": "abc"}) is None)
+    check("host_uin 字段同样可用", api._extract_host_uin({"host_uin": "10001"}) == 10001)
+
+    print("\n[8c] 安全关键：认不出说说时必须放弃，不能去查自己空间")
+    calls = {"msglist": 0}
+    real_session = api.aiohttp.ClientSession
+    real_msglist = api._fetch_msglist
+
+    class _ResolveOnly:
+        """只允许解析短链；一旦有人拉动态列表就说明逻辑跑偏了。"""
+
+        def __init__(self, **kw):
+            pass
+
+        def get(self, url, **kw):
+            class R:
+                url = "https://mobile.qzone.qq.com/l?g=1502&i=x&u=1596574632"
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *e):
+                    return False
+
+                async def read(self):
+                    return b""
+
+                async def text(self):
+                    return ""
+
+            return R()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *e):
+            return False
+
+    async def counting_msglist(*a, **kw):
+        calls["msglist"] += 1
+        return [{"cellid": "whatever", "content": "机器人自己空间的第一条"}], 0
+
+    api.aiohttp.ClientSession = _ResolveOnly
+    api._fetch_msglist = counting_msglist
+    try:
+        got = asyncio.run(
+            api.fetch_post(
+                api.QzoneCredentials(uin=3237747236, skey="s", p_skey="p"),
+                "https://mobile.qzone.qq.com/l?g=1502&i=a8cb295f29ebaf6a42240d00&u=1596574632&a=311",
+            )
+        )
+    finally:
+        api.aiohttp.ClientSession = real_session
+        api._fetch_msglist = real_msglist
+
+    check("短链无法定位时返回 None", got is None, repr(got))
+    check("且完全没有去查动态列表（不读自身空间）", calls["msglist"] == 0, str(calls))
 
     print("\n[9] 插件组装逻辑（注入文本 + 图片裁剪）")
     main_mod = load_main_module()
@@ -356,8 +442,9 @@ def main() -> int:
 
     # 用假 session 让 fetch_post 走到解析分支，验证失效码会抛出
     class FakeResp:
-        def __init__(self, body: bytes, status=200):
+        def __init__(self, body: bytes, url: str, status=200):
             self._body = body
+            self.url = url  # 真实响应有 url，_resolve_share 依赖它
             self.status = status
 
         async def read(self):
@@ -373,8 +460,9 @@ def main() -> int:
         def __init__(self, body: bytes):
             self._body = body
 
-        def get(self, url, params=None, headers=None):
-            return FakeResp(self._body)
+        def get(self, url, params=None, headers=None, **kw):
+            # 真实调用会传 allow_redirects 等参数，桩必须一并接受
+            return FakeResp(self._body, url)
 
         async def __aenter__(self):
             return self
@@ -388,8 +476,8 @@ def main() -> int:
         api.aiohttp.ClientSession = lambda **kw: FakeSession(body)
         try:
             return await api.fetch_post(
-                api.QzoneCredentials(uin=1, skey="s", p_skey="p"),
-                "https://h5.qzone.qq.com/ugc/share?res_uin=1&cellid=c",
+                api.QzoneCredentials(uin=10001, skey="s", p_skey="p"),
+                "https://h5.qzone.qq.com/ugc/share?res_uin=10001&cellid=c",
             )
         finally:
             api.aiohttp.ClientSession = real_session

@@ -273,34 +273,112 @@ async def fetch_post(
 ) -> QzonePost | None:
     """按分享链接拉取该条说说的完整内容。"""
     params = parse_share_url(share_url)
-    # res_uin 是分享页标注的内容所属账号；没有就退回用自己看得见的动态去匹配
-    host_uin = params.get("res_uin") or params.get("uin") or str(creds.uin)
-    host_uin = host_uin.lstrip("o") if host_uin[:1].lower() == "o" else host_uin
-    if not host_uin.isdigit():
-        host_uin = str(creds.uin)
-    cell_id = params.get("cellid") or ""
 
     conn_timeout = aiohttp.ClientTimeout(total=timeout)
     async with aiohttp.ClientSession(timeout=conn_timeout) as session:
+        # 短链（mobile.qzone.qq.com/l）本身不带 res_uin/cellid，
+        # 必须先跟随跳转拿到 h5 分享页地址，否则无法确定是哪条说说。
+        final_url, final_params = await _resolve_share(session, creds, share_url)
+        if _has_feed_locator(final_params):
+            params = final_params
+
+        host_uin = _extract_host_uin(params)
+        if not host_uin:
+            # 认不出是谁的说说就放弃。绝不退回自己的 uin —— 那会读到
+            # 机器人自己空间的第一条说说，并把无关内容注入对话。
+            logger.warning(
+                "[qzone_reader] 分享链接里没有可用的说说定位参数，放弃读取: %s",
+                share_url,
+            )
+            return None
+
+        if final_url != share_url:
+            logger.info("[qzone_reader] 分享短链已解析为: %s", final_url)
+
+        cell_id = str(params.get("cellid") or params.get("fid") or "")
+
         msglist, error = await _fetch_msglist(session, creds, int(host_uin))
         if error in AUTH_ERROR_CODES:
             raise QzoneAuthError(f"QQ空间登录态失效（code={error}）")
         if not msglist:
             return None
 
-        picked = _pick_feed(msglist, cell_id=cell_id, share_url=share_url)
+        picked = _pick_feed(msglist, cell_id=cell_id, share_url=final_url or share_url)
         if picked is None:
+            logger.warning(
+                "[qzone_reader] 在 uin=%s 的动态里没找到该条说说（cellid=%s），放弃",
+                host_uin,
+                cell_id or "无",
+            )
             return None
 
-        post = _post_from_feed(picked, share_url=share_url)
+        post = _post_from_feed(picked, share_url=final_url or share_url)
 
         # 列表接口的正文可能被截断，命中后用详情接口拿全文
         tid = str(picked.get("tid") or "")
         if tid:
             detail = await _fetch_detail(session, creds, int(host_uin), tid)
             if detail:
-                post = _post_from_feed(detail, share_url=share_url, base=post)
+                post = _post_from_feed(
+                    detail, share_url=final_url or share_url, base=post
+                )
         return post
+
+
+def _has_feed_locator(params: dict[str, str]) -> bool:
+    """判断一组参数里是否有能定位具体说说的信息。"""
+    if any(params.get(k) for k in ("cellid", "fid", "res_uin", "host_uin")):
+        return True
+    return _extract_host_uin(params) is not None
+
+
+def _extract_host_uin(params: dict[str, str]) -> int | None:
+    """从参数里取出说说所属账号的 QQ 号。
+
+    只认明确的字段。短链里的 `u=` / `i=` 是内部标识或哈希，不是 QQ 号，
+    拿它当 uin 会查到完全无关的账号。
+    """
+    for key in ("res_uin", "host_uin", "uin"):
+        raw = str(params.get(key) or "").strip()
+        if raw[:1].lower() == "o":
+            raw = raw[1:]
+        if raw.isdigit() and 4 < len(raw) <= 12:
+            return int(raw)
+    return None
+
+
+async def _resolve_share(
+    session: aiohttp.ClientSession,
+    creds: QzoneCredentials,
+    url: str,
+) -> tuple[str, dict[str, str]]:
+    """跟随分享短链跳转，返回 (最终地址, 最终地址的参数)。
+
+    失败时原样返回入参，由调用方决定是否放弃。
+    """
+    try:
+        async with session.get(
+            url, headers=creds.headers(), allow_redirects=True
+        ) as resp:
+            final = str(resp.url)
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        logger.warning("[qzone_reader] 解析分享链接失败: %s", exc)
+        return url, parse_share_url(url)
+
+    params = parse_share_url(final)
+    if _has_feed_locator(params):
+        return final, params
+
+    # 有的短链不靠跳转，而是把真实地址放在 HTML 里
+    try:
+        text = await _get_text(session, url, creds, {})
+    except Exception:  # noqa: BLE001
+        return final, params
+    for found in _URL_RE.findall(text or ""):
+        cand = parse_share_url(unescape(found))
+        if _has_feed_locator(cand):
+            return found, cand
+    return final, params
 
 
 async def _fetch_msglist(
@@ -412,7 +490,7 @@ def _pick_feed(
             if str(feed.get("cellid") or "") == cell_id:
                 return feed
 
-    # 兜底：用分享链接里的时间戳/摘要去比对，再不行就取第一条
+    # 兜底：用分享链接里的时间戳去比对
     params = parse_share_url(share_url)
     for key in ("begintime", "t", "time"):
         raw = params.get(key) or ""
@@ -423,7 +501,11 @@ def _pick_feed(
                 created = _as_int(feed.get("created_time"))
                 if created and abs(created - want) <= 120:
                     return feed
-    return msglist[0] if msglist else None
+
+    # 定位不到就返回 None。
+    # 这里绝不能用 msglist[0] 兜底：拿不准具体是哪一条时随便挑一条，
+    # 会把完全无关的说说当成用户转发的内容注入对话。
+    return None
 
 
 def _post_from_feed(
