@@ -1,4 +1,4 @@
-﻿# 开发文档
+# 开发文档
 
 面向维护者。用户使用说明见 [README.md](README.md)。
 
@@ -63,7 +63,8 @@ astrbot_plugin_qzone_reader/
 
 ```
 ① 消息事件
-   capture_qzone_share(event)
+   capture_qzone_share(event)          ← 整体包在 try/except 里（异常绝不能冒泡）
+     ├─ _sweep_pending()              回收过期暂存
      ├─ _in_scope(event)              会话白名单
      ├─ _find_share_url(event)        识别链接
      │    ├─ Comp.Json.data           ← 主路径（分享卡片）
@@ -73,12 +74,15 @@ astrbot_plugin_qzone_reader/
      ├─ _build_payload(event, url)    取内容
      │    ├─ _get_credentials()       登录态（带缓存）
      │    └─ _fetch_with_retry()      → fetch_post()（见下）
-     └─ self._pending[id(event)] = (text, images)   暂存
+     └─ token = uuid4().hex           暂存
+        self._pending[token] = (text, images, monotonic())
+        event.set_extra(PENDING_EXTRA_KEY, token)
 
 ② LLM 请求钩子
    inject_qzone_content(event, req)
-     ├─ self._pending.pop(id(event))  取出并清理暂存
-     ├─ _platform_ok(event)           手动平台门禁（见「陷阱」）
+     ├─ _sweep_pending()                   回收过期暂存
+     ├─ _take_pending(event)               用事件上的 token 取出并 pop
+     ├─ _platform_ok(event)                手动平台门禁（见「陷阱」）
      ├─ req.extra_user_content_parts.append(TextPart(text))
      └─ req.image_urls.extend(images)
 
@@ -91,7 +95,10 @@ astrbot_plugin_qzone_reader/
 ```
 fetch_post(creds, share_url)
   │
-  ├─ _resolve_share()                  跟随 302 跳转，拿最终地址与参数
+  ├─ is_trusted_qzone_url()            入口门禁：非白名单域名直接放弃
+  │
+  ├─ _resolve_share()                  逐跳跟随 302，拿最终地址与参数
+  │     └─ fetch_trusted()             每跳重新决定请求头（见「凭据边界」）
   │
   ├─ 首选：_fetch_from_share_page()    解析 h5 分享页
   │     ├─ _share_page_candidates()    候选地址（带/不带尾斜杠）
@@ -100,20 +107,60 @@ fetch_post(creds, share_url)
   │     └─ _post_from_cell()           转成 QzonePost（含 cell_original）
   │
   └─ 兜底：_fetch_via_msglist()        列表接口
-        ├─ _extract_host_uin()         只认明确字段，认不出就放弃
+        ├─ _extract_host_uin()         只认 res_uin / host_uin，认不出就放弃
         ├─ _fetch_msglist()            emotion_cgi_msglist_v6
         ├─ _pick_feed()                定位；定位不到返回 None
         └─ _fetch_detail()             取全文
 ```
 
+## 凭据边界（改动这里前务必读完）
+
+插件的所有网络请求都带账号登录态，所以「凭据能发到哪些主机」是一条独立的安全边界，
+由 `core/qzone_api.py` 里两个**按解析后 hostname 匹配**的白名单控制：
+
+| 常量 | 作用 | 内容 |
+| --- | --- | --- |
+| `TRUSTED_SHARE_HOSTS` | 哪些地址**可以抓、可以当分享页解析** | `qzone.qq.com`、`qzonestyle.gtimg.cn` |
+| `CREDENTIAL_HOSTS` | 哪些地址**可以收到 Cookie** | 上面两个 + `qpic.cn`、`qlogo.cn`、`gtimg.cn`、`photo.store.qq.com` |
+
+配图必须带 Cookie 才能下载（`m.qpic.cn`、`r.photo.store.qq.com` 是真实说说里的图床域名，
+见 `tests/fixtures/repost_cell.json`），所以第二个白名单比第一个宽。
+
+三条实现约束：
+
+1. **绝不能用「URL 里包含 qzone.qq.com」这种子串判断**。早期版本就是这么写的，
+   于是 `https://evil.example/?x=qzone.qq.com` 会被当成分享链接，而请求会带着
+   `Cookie: uin=o…; skey=…; p_skey=…` 发到 `evil.example` —— 等于把账号登录态送出去。
+   `test_core.py` 的 `[22]` 段钉死了这一点（7 个恶意形态）。
+2. **`QzoneCredentials.headers(referer=None, *, url=None)` 是 fail-closed 的**：
+   只有传入 `url` 且它落在 `CREDENTIAL_HOSTS` 内才会带 Cookie。不传 url 就不带凭据 ——
+   忘记传参只会让这次请求没有登录态，而不会把 Cookie 发错地方。
+3. **跳转必须逐跳自己跟随**（`fetch_trusted`），不能用 `allow_redirects=True`：
+   aiohttp 跟随时会把原始请求头原样带到新地址（只去掉 Authorization），
+   所以一次性设好的 Cookie 会跨主机泄露。逐跳跟随还顺带对齐了两个语义：
+   首跳之后不再携带原始 query（避免 `uin`/`g_tk` 跟着跳转跑）、整条链共用一个总超时。
+
+残余风险（已接受，改动时留意）：白名单**内部**主机之间互跳仍会带 Cookie，
+所以边界等价于「任何白名单域名被攻破或被开放重定向」；`Referer` / `Origin`
+始终带有你的 QQ 号（图床需要它，没有一起收紧）。
+
 ## API 参考
 
 ### `main.py`
 
+`PENDING_EXTRA_KEY` / `PENDING_TTL`：待注入内容的暂存约定。
+事件上只挂一个随机 token（`event.set_extra`），内容本体留在 `self._pending[token]`，
+带上写入时间；两个钩子都会先 `_sweep_pending()` 回收超过 `PENDING_TTL` 的条目。
+**不要改回 `id(event)` 作键**：事件对象回收后 id 会被复用，残留条目可能被后来的
+无关消息 pop 掉，把别人的说说内容注入进这一轮对话。
+
 | 成员 | 说明 |
 | --- | --- |
-| `QzoneReaderPlugin.capture_qzone_share(event)` | `@filter.event_message_type(ALL)`。识别链接并预取内容，结果存入 `_pending` |
+| `QzoneReaderPlugin.capture_qzone_share(event)` | `@filter.event_message_type(ALL)`。整体包 try/except（异常冒泡会让 AstrBot `stop_event`，本轮连 LLM 都不会请求）。内部转调 `_capture()` |
+| `_capture(event)` | 白名单 → 唤醒门禁 → 识别链接 → 取内容 → 挂 token 暂存 |
 | `QzoneReaderPlugin.inject_qzone_content(event, req)` | `@filter.on_llm_request()`。注入文本与图片 |
+| `_remember_token(event, token)` / `_read_token(event)` | 事件上挂/取 token；取不到一律当作「没有待注入内容」（测试桩传入 `object()` 也不会炸） |
+| `_sweep_pending()` / `_take_pending(event)` | 回收过期条目 / 取出并 pop 本轮内容 |
 | `_build_payload(event, share_url) -> (str, list[str])` | 取内容 + 渲染 + 决定附图，返回待注入文本与图片 URL |
 | `_fetch_with_retry(event, creds, url)` | 登录态失效时清缓存重取一次 |
 | `_get_credentials(event)` | 按 `cookie_source` 取登录态，带 TTL 缓存与手动兜底 |
@@ -130,7 +177,8 @@ fetch_post(creds, share_url)
 | `_with_instruction(body, mode)` | 按模式决定是否给正文加指令前缀 |
 | `_append_extra_part(req, text, persist)` | 注入文本块；`persist=False` 时标记 `mark_as_temp()` |
 | `_append_image_part(req, url)` | 以**临时** `ImageURLPart` 注入图片，避免落历史 |
-| `_append_extra_part(req, text)` | 注入文本块，优先 `TextPart`，取不到退回 dict |
+| `_bounded_int(key, default, minimum=0)` | 整数配置解析：非法值回退 `default`、再取 `minimum` 下界 |
+| `_int_config(key, default, fallback, allow_zero)` | 在 `_bounded_int` 之上表达「0 表示默认值 / 0 表示不限制」两种语义 |
 
 模块级常量：
 
@@ -196,7 +244,7 @@ fetch_post(creds, share_url)
 
 | 类型 | 说明 |
 | --- | --- |
-| `QzoneCredentials` | `uin` / `skey` / `p_skey` / `source`；`gtk` 属性推导 `g_tk`；`headers()` 生成请求头 |
+| `QzoneCredentials` | `uin` / `skey` / `p_skey` / `source`；`gtk` 属性推导 `g_tk`；`headers(referer, url=…)` 生成请求头（**只有 url 在白名单内才带 Cookie**） |
 | `QzonePost` | 一条说说的可读内容，转发用 `original_*` 字段表达第二层 |
 | `QzoneAuthError` | 登录态失效。调用方据此清缓存重取 |
 | `CookieCache` | 带 TTL 的登录态缓存，`ttl=0` 表示不缓存 |
@@ -220,11 +268,13 @@ fetch_post(creds, share_url)
 
 | 函数 | 说明 |
 | --- | --- |
-| `extract_share_url(payload)` | 递归扫描任意 JSON/文本，找出 QQ空间分享地址。会先 `unescape`，因为 QQ 卡片把逗号转义成 `&#44;` |
+| `extract_share_url(payload)` | 递归扫描任意 JSON/文本，找出 QQ空间分享地址。会先 `unescape`（QQ 卡片把逗号转义成 `&#44;`），再**按解析后的 hostname 过白名单** |
+| `is_trusted_qzone_url(url)` / `may_send_credentials(url)` | 两个凭据边界判定：能不能抓这个地址 / 能不能给它发 Cookie |
+| `fetch_trusted(session, url, params, creds, …)` | 逐跳跟随跳转的 GET，返回 `(最终地址, 状态码, 响应体)`；每跳重新决定请求头 |
 | `extract_card_text(payload, limit=300)` | 取卡片标题/摘要作为降级文案 |
 | `parse_share_url(url)` | 解析 query。分隔符同时支持 `&` 和 `,` |
 | `credentials_from_cookie_string(s, source)` | 解析 Cookie，缺 `uin`/`skey` 返回 `None` |
-| `_extract_host_uin(params)` | 只认 `res_uin`/`host_uin`/`uin` 且校验位数 |
+| `_extract_host_uin(params)` | 只认 `res_uin` / `host_uin` 且校验位数（裸 `uin` 可能是分享者而非作者，不再采信） |
 | `_has_feed_locator(params)` | 判断一组参数能否定位到具体说说 |
 | `_looks_like_share(url)` | 是否是说说分享链接 |
 
@@ -272,8 +322,10 @@ fetch_post(creds, share_url)
 | --- | --- |
 | `is_tall(width, height, threshold)` | 是否算长截图：`height >= threshold` 且 `height > width * 1.5` |
 | `slice_image(data, slice_height, overlap, max_slices)` | 切成长图 data URL 列表；不需切或失败返回 `[]` |
-| `fetch_bytes(session, url, headers, timeout)` | 下载图片字节，失败返回 `None` |
-| `prepare_images(session, urls, budget, ...)` | 按预算挑选图片，长图切片、其余原样 |
+| `fetch_bytes(session, url, headers, timeout)` | 下载图片字节，失败返回 `None`（`fetcher=None` 时使用，不带任何凭据） |
+| `prepare_images(session, urls, budget, ...)` | 按预算挑选图片，长图切片、其余原样；只返回图片引用列表（薄封装） |
+| `prepare_images_with_coverage(session, urls, budget, fetcher, ...)` | 同上，但返回 `(图片引用列表, covered)`；`covered` 是**实际被覆盖到的候选图张数** |
+| `fetcher` 参数 | `async (url) -> bytes \| None`；`main` 传入它以便图片下载也走 `fetch_trusted`（凭据只发白名单主机、逐跳校验） |
 
 常量：`DEFAULT_TALL_THRESHOLD=1600`、`DEFAULT_SLICE_HEIGHT=1280`、`DEFAULT_OVERLAP=80`、`MAX_SLICES_PER_IMAGE=12`、`JPEG_QUALITY=88`、`DEFAULT_MAX_WIDTH=1024`。
 
@@ -405,9 +457,20 @@ orglikekey : http://user.qzone.qq.com/<原作者uin>/mood/<原cellid>
 
 ### 为什么内容要提前取
 
-`on_llm_request` 里做网络请求会阻塞 LLM 请求链路（AstrBot 在那里持有 session lock）。所以在消息阶段取好，暂存在 `self._pending[id(event)]`，注入时 `pop` 掉。
+`on_llm_request` 里做网络请求会阻塞 LLM 请求链路（AstrBot 在那里持有 session lock）。所以在消息阶段取好，暂存在 `self._pending[token]`，注入时 `pop` 掉。
 
-`id(event)` 作键在注入后会立刻清理，正常情况下不会泄漏；极端情况下某条消息没走到 LLM 请求，会残留一条，属于可接受的小泄漏。
+**为什么键是随机 token 而不是 `id(event)`**：早期版本用 `id(event)` 作键，有两个问题。
+① 事件对象在流水线结束后会被回收，`id` 会被 CPython 复用，于是残留的旧条目可能被
+后来的**无关消息** pop 掉，把上一条说说注入进这一轮对话并写进历史；
+② 没有兜底清理，没走到 LLM 请求的消息会一直残留。
+现在 capture 阶段生成 `uuid4().hex` 作 token，把 token 挂在事件自己身上
+（`event.set_extra`），注入阶段从同一个事件取回 —— 两个钩子拿到的是同一个事件对象
+（`internal.py:352` 把同一个 event 传给 `call_event_hook`，`context_utils.py:101` 直接透传给 handler），
+所以 capture 与 inject 不可能算出不同的键；`_sweep_pending()` 再兜底回收超过
+`PENDING_TTL`（300 秒）的条目。
+
+内容本体刻意留在插件里、只把短 token 挂到事件上：图片可能是好几 MB 的 base64，
+而 `event._extras` 是个公共字典，`clear_extra()` 会把它整段打进日志。
 
 ### 为什么附图优先原文配图
 
@@ -599,7 +662,7 @@ cd astrbot_plugin_qzone_reader
 python test_core.py
 ```
 
-当前 **232 项断言**。分段：
+当前 **297 项断言**。分段：
 
 | 段 | 覆盖 |
 | --- | --- |
@@ -616,8 +679,23 @@ python test_core.py
 | `[19]` | 注入流程按 `context_mode` 分流（图片走哪个字段） |
 | `[20]` | **群聊引用卡片**：`Reply.chain` 递归、嵌套引用、自引用保护、顶层优先 |
 | `[21]` | **唤醒门禁**：未 @bot 时不做任何抓取、属性缺失时保守放行 |
+| `[22]` | **地址白名单**：7 个恶意形态必须被拒、可信地址必须被接受、畸形输入不抛异常 |
+| `[22b]` | **跳转逐跳校验**：非白名单跳转不带 Cookie、跳转后不携带原 query、状态码透传并告警 |
+| `[22c]` | **入口门禁**：非白名单地址连 `ClientSession` 都不创建 |
+| `[22d]` | 非法配置下插件仍能构造、抓取异常不冒泡 |
+| `[22e]` | **图片覆盖张数**：`covered` 与渲染文案一致，不再把切片块数说成原图张数 |
+| `[22f]` | 裸 `uin` 不再采信、分享页候选地址三种形态 |
+| `[22g]` | **待注入 token**：不串内容、无 token 不注入、过期回收 |
 
-> **写测试桩时注意**：`fetch_bytes` 和 `_get_html` 都会读 `resp.status`，桩必须提供该属性。早期漏了它，导致 `status >= 400` 抛 `AttributeError` 被兜底 `except` 吞掉，表现为「图片莫名退回原 URL」——排查了好一阵。
+> **写测试桩时注意**：桩必须提供 `resp.status`（`fetch_bytes` 会读），
+> 并且返回体要是 `async with` 可用的上下文管理器（`fetch_trusted` 也这样用）。
+> 早期漏了 `status`，导致 `status >= 400` 抛 `AttributeError` 被兜底 `except` 吞掉，
+> 表现为「图片莫名退回原 URL」——排查了好一阵。
+>
+> 另外：任何**喂给 `capture_qzone_share` / `inject_qzone_content` 的桩事件**
+> 都要提供 `set_extra` / `get_extra`（继承测试里的 `_Extras` 即可），
+> 否则待注入内容挂不上事件、注入阶段取不到。`[9]` 段那条 `object()` 是刻意保留的
+> fail-closed 用例：实现用 `getattr` 读取，取不到就当没有内容。
 
 ### 文档一致性检查
 
@@ -740,7 +818,13 @@ print(cell.keys() if cell else "解析失败")
 | `photourl` 的尺寸键 | `"0"`/`"1"`/`"11"` 等键含义未证实，现按面积挑最大，属于启发式 |
 | `_pick_feed` 的时间戳兜底 | 分享页路径失效、退回列表接口时才用到，窗口 ±120 秒，可能误匹配 |
 | `AUTH_ERROR_CODES` | 只收了 `-3000`/`-10000`/`-4001`，其他失效码会走普通异常路径（不重取登录态） |
-| `id(event)` 作暂存键 | 极端情况下未走到 LLM 请求的消息会残留一条暂存 |
+| 待注入内容靠事件 token 索引 | 事件若不提供 `set_extra`/`get_extra`，本轮**不注入**（fail-closed，可接受）；没走到 LLM 请求的条目由 `_sweep_pending()` 在 300 秒后回收 |
+| **白名单内主机互跳仍带 Cookie** | 逐跳校验只保证「凭据不发往白名单外的主机」；若某个白名单域名被攻破或存在开放重定向，登录态仍可能泄露。彻底消除需要放弃白名单内的跳转，代价是短链解析可能失效 |
+| **`Referer` / `Origin` 未一起收紧** | 两者始终带有 `user.qzone.qq.com/<uin>`，即使用户 QQ 号暴露给任意被抓取的主机。图床需要 qzone 的 Referer，所以没有一并收紧 |
+| **`CREDENTIAL_HOSTS` 取自两份真实样本** | 白名单来自 fixture 里的 `m.qpic.cn` / `r.photo.store.qq.com`。真实 feed 若用了列表外的图床，那些图会**不带登录态**去下载（行为是退回原 URL，不会崩），需要按日志补域名 |
+| **1280–1599 高的长截图不切片** | 低于 `DEFAULT_TALL_THRESHOLD=1600`，会交给 AstrBot 按长边上限缩放（宽度损失约 2%~20%）。改成按 1280 切片能保住宽度，但每张会多出一个 80~300px 的碎块并多占一个图片额度，实测不划算，故保留现状 |
+| **`_bounded_int` 的非法值语义变化** | 非法 `image_max_width` 从「0 = 不缩放」改为「回退默认 1024」，非法 `max_images` 从 0 改为 4 —— 即非法值不再静默关掉功能，而是回到 schema 默认值。`[22d]` 段钉住了新语义 |
+| **跳转链共用一个总超时** | `fetch_trusted` 用 `total_timeout` 给整条链计时，不再每跳重新计时；跳数上限取 aiohttp 默认的 10 |
 | 分享页可能返回登录页 | 此时 `FrontPage` 仍在但 `data` 为空，会落到列表接口兜底 |
 | 视频 | 只记录数量，未解析。`cell_video()` 已能取地址，但未接入注入 |
 | 切片参数为经验值 | `DEFAULT_SLICE_HEIGHT=1280`、`is_tall` 的 1.5 倍判据都基于常见视觉模型的缩放行为，未针对具体模型实测校准。不同模型的上限不同，必要时可用 `slice_max_height` 调整 |

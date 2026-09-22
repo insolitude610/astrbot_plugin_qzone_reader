@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+import uuid
+from time import monotonic
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
@@ -18,6 +21,7 @@ import aiohttp
 
 from .core import images as image_utils
 from .core.qzone_api import (
+    DEFAULT_COOKIE_TTL,
     CookieCache,
     QzoneAuthError,
     QzoneCredentials,
@@ -25,7 +29,14 @@ from .core.qzone_api import (
     extract_card_text,
     extract_share_url,
     fetch_post,
+    fetch_trusted,
 )
+
+# 待注入内容的暂存键与存活时间。
+# 内容本身留在插件里，事件上只挂一个 token —— 图片可能是好几 MB 的 base64，
+# 不该塞进 event._extras（那是个公共字典，别人 get_extra() 一把捞出来会很难看）。
+PENDING_EXTRA_KEY = "qzone_reader_pending"
+PENDING_TTL = 300
 
 # 统一保留：一次注入里的图片总数上限由 max_images 决定，不再有隐藏硬上限。
 # 两种模式共用的叙述规范，放在指令最前面。
@@ -82,15 +93,28 @@ class QzoneReaderPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
-        self.cookies = CookieCache(self.config.get("cookie_ttl", 600))
-        # 每一次用户消息都是一批新的注入，键是 event 对象本身
-        self._pending: dict[int, tuple[str, list[str]]] = {}
+        self.cookies = CookieCache(
+            self.config.get("cookie_ttl", DEFAULT_COOKIE_TTL)
+        )
+        # 每一条待注入的内容用一个随机 token 索引，token 挂在 event 上。
+        # 不用 id(event) 作键：事件对象回收后 id 会被复用，残留的旧条目可能被
+        # 后来的无关消息 pop 掉，把别人的说说内容注入进这一轮对话。
+        self._pending: dict[str, tuple[str, list[str], float]] = {}
 
     # ------------------------------------------------------------------ 读取
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def capture_qzone_share(self, event: AstrMessageEvent):
         """识别 QQ空间分享卡片，先把正文和图片准备好，等注入阶段使用。"""
+        self._sweep_pending()
+        try:
+            await self._capture(event)
+        except Exception as exc:  # noqa: BLE001
+            # 这里绝不能抛出去：本 handler 跑在 AstrBot 的插件 handler 循环里，
+            # 抛异常会被 stop_event，本轮连 LLM 都不会请求，还会给用户回一句报错。
+            logger.warning("[qzone_reader] 处理分享卡片时异常，已忽略本轮: %s", exc)
+
+    async def _capture(self, event: AstrMessageEvent) -> None:
         if not self._in_scope(event):
             return
 
@@ -109,8 +133,68 @@ class QzoneReaderPlugin(Star):
         logger.info("[qzone_reader] 检测到 QQ空间分享，开始读取: %s", share_url)
 
         text, images = await self._build_payload(event, share_url)
-        if text:
-            self._pending[id(event)] = (text, images)
+        if not text:
+            return
+        token = uuid.uuid4().hex
+        self._pending[token] = (text, images, monotonic())
+        if not self._remember_token(event, token):
+            # 事件上挂不住 token 时，保留条目只会变成无人认领的垃圾
+            self._pending.pop(token, None)
+
+    # ------------------------------------------------------------ 待注入暂存
+
+    @staticmethod
+    def _remember_token(event: AstrMessageEvent, token: str) -> bool:
+        """把 token 挂到事件上，供注入阶段取回。
+
+        取不到 set_extra（测试桩或极老的适配器）时返回 False，调用方会丢弃该条目。
+        """
+        setter = getattr(event, "set_extra", None)
+        if not callable(setter):
+            return False
+        try:
+            setter(PENDING_EXTRA_KEY, token)
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    @staticmethod
+    def _read_token(event: AstrMessageEvent) -> str | None:
+        """从事件上取回 token；取不到一律当作「没有待注入内容」。"""
+        getter = getattr(event, "get_extra", None)
+        if not callable(getter):
+            return None
+        try:
+            token = getter(PENDING_EXTRA_KEY)
+        except Exception:  # noqa: BLE001
+            return None
+        return token if isinstance(token, str) and token else None
+
+    def _sweep_pending(self) -> None:
+        """清掉过期的暂存条目。
+
+        正常路径下注入阶段会 pop 掉；但如果某条消息最终没走到 LLM 请求
+        （比如被别的插件 stop_event 了），条目就会留下来，这里兜底回收。
+        """
+        if not self._pending:
+            return
+        now = monotonic()
+        stale = [key for key, item in self._pending.items() if now - item[2] > PENDING_TTL]
+        for key in stale:
+            self._pending.pop(key, None)
+
+    def _take_pending(self, event: AstrMessageEvent) -> tuple[str, list[str]] | None:
+        """取出并清理本轮待注入内容；没有则返回 None。"""
+        token = self._read_token(event)
+        if token is None:
+            return None
+        entry = self._pending.pop(token, None)
+        if entry is None:
+            return None
+        text, images, created_at = entry
+        if monotonic() - created_at > PENDING_TTL:
+            return None
+        return text, images
 
     @staticmethod
     def _will_wake_bot(event: AstrMessageEvent) -> bool:
@@ -134,7 +218,8 @@ class QzoneReaderPlugin(Star):
         注意：on_llm_request 不经过 event_filters，平台/会话过滤必须在这里手动做。
         另外这里绝不能调用 stop_event()，否则本轮消息不会被写入历史。
         """
-        payload = self._pending.pop(id(event), None)
+        self._sweep_pending()
+        payload = self._take_pending(event)
         if payload is None:
             return
         if not self._platform_ok(event):
@@ -160,17 +245,15 @@ class QzoneReaderPlugin(Star):
         self, event: AstrMessageEvent, share_url: str
     ) -> tuple[str, list[str]]:
         """拉取说说内容并渲染成待注入的文本与图片列表。"""
-        max_images = max(int(self.config.get("max_images", 4) or 0), 0)
+        max_images = self._bounded_int("max_images", 4)
         mode = self._summarize_mode()
         notify = bool(self.config.get("notify_on_failure", True))
 
         post = None
-        # QQ空间图床要 Referer，下载配图时复用登录态请求头
-        creds_headers: dict[str, str] = {}
+        creds: QzoneCredentials | None = None
         if self.config.get("read_full_feed", True):
             creds = await self._get_credentials(event)
             if creds is not None:
-                creds_headers = creds.headers()
                 post = await self._fetch_with_retry(event, creds, share_url)
             else:
                 logger.warning("[qzone_reader] 没有可用的 QQ空间登录态")
@@ -199,9 +282,11 @@ class QzoneReaderPlugin(Star):
             if url not in candidates:
                 candidates.append(url)
 
-        images = await self._prepare_images(event, candidates, max_images, creds_headers)
+        images, covered = await self._prepare_images(
+            event, candidates, max_images, creds
+        )
 
-        body = post.to_prompt(max_images=len(images))
+        body = post.to_prompt(max_images=len(images), covered_images=covered)
         return self._with_instruction(body, mode), images
 
     async def _prepare_images(
@@ -209,15 +294,19 @@ class QzoneReaderPlugin(Star):
         event: AstrMessageEvent,
         candidates: list[str],
         budget: int,
-        headers: dict[str, str],
-    ) -> list[str]:
+        creds: QzoneCredentials | None,
+    ) -> tuple[list[str], int]:
         """按预算准备配图：长截图切片、超宽图缩放。
 
         budget 是最终图片总数上限，切片计入其中 —— 否则一本瓜条的十余张
         长图能切成几十片，token 会失控。
+
+        Returns:
+            (图片引用列表, 实际覆盖到的候选图张数)，后者用于如实描述
+            「已附带前几张原图」。
         """
         if budget <= 0 or not candidates:
-            return []
+            return [], 0
         slice_tall = bool(self.config.get("slice_tall_images", True))
         slice_height = self._int_config(
             "slice_max_height", 0, fallback=image_utils.DEFAULT_SLICE_HEIGHT
@@ -229,16 +318,32 @@ class QzoneReaderPlugin(Star):
 
         # 既没开切片、也不限宽度时无需任何处理
         if not slice_tall and (not max_width or max_width <= 0):
-            return candidates[:budget]
+            return candidates[:budget], min(len(candidates), budget)
 
         timeout = aiohttp.ClientTimeout(total=30)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                return await image_utils.prepare_images(
+                fetcher = None
+                if creds is not None:
+                    # 图片下载同样走逐跳校验：凭据只发给白名单主机，
+                    # 跳转目标不在白名单时不会带上 Cookie。
+                    async def _fetch_image(url: str) -> bytes | None:
+                        _final, status, body = await fetch_trusted(
+                            session, url, creds=creds
+                        )
+                        if status >= 400:
+                            logger.debug(
+                                "[qzone_reader] 图片下载 HTTP %s: %s", status, url
+                            )
+                        return body or None
+
+                    fetcher = _fetch_image
+
+                return await image_utils.prepare_images_with_coverage(
                     session,
                     candidates,
                     budget=budget,
-                    headers=headers,
+                    fetcher=fetcher,
                     slice_tall=slice_tall,
                     slice_height=slice_height,
                     quality=quality,
@@ -246,7 +351,19 @@ class QzoneReaderPlugin(Star):
                 )
         except Exception as exc:  # noqa: BLE001 - 图片处理失败不该打断对话
             logger.warning("[qzone_reader] 配图处理失败，退回原始地址: %s", exc)
-            return candidates[:budget]
+            return candidates[:budget], min(len(candidates), budget)
+
+    def _bounded_int(self, key: str, default: int, *, minimum: int = 0) -> int:
+        """读一个整数配置：解析失败回退 default，否则取下界。
+
+        与旧实现（解析失败折算成 0）的区别：非法值现在回退到 schema 里的默认值，
+        而不是悄悄把功能关掉 —— 例如 image_max_width 写成 "abc" 不再等于「不缩放」。
+        """
+        try:
+            value = int(self.config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(value, minimum)
 
     def _int_config(self, key: str, default: int, *, fallback: int | None = None, allow_zero: bool = False) -> int:
         """读一个整数配置，非法值回退。
@@ -254,10 +371,7 @@ class QzoneReaderPlugin(Star):
         fallback 用于「0 表示用默认值」的配置（如 slice_max_height）；
         allow_zero 用于「0 表示不限制」的配置（如 image_max_width）。
         """
-        try:
-            value = int(self.config.get(key, default) or 0)
-        except (TypeError, ValueError):
-            value = 0
+        value = self._bounded_int(key, default)
         if value <= 0:
             if allow_zero:
                 return 0

@@ -5,7 +5,7 @@ desc: >-
   当你把 QQ空间说说以小程序卡片/分享链接的形式转发给 bot 时，插件会用 NapCat 的登录态拉取该条说说的完整内容（正文、图片、作者、时间），
   把内容注入本轮对话，于是 bot 可以自动总结，并且该内容会随消息一起进入会话历史，之后可以继续追问讨论。
 author: insolitude610
-version: v1.0.0
+version: v1.0.1
 repo: https://github.com/insolitude610/astrbot_plugin_qzone_reader
 tags:
   - QQ空间

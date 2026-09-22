@@ -10,6 +10,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from time import monotonic
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 PKG_NAME = "qzone_reader_pkg"
@@ -31,6 +32,33 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 class _Logger:
     def __getattr__(self, _name):
         return lambda *a, **k: None
+
+
+class _Extras:
+    """复刻 AstrMessageEvent 的 per-event 额外信息存储。
+
+    插件用 event.set_extra/get_extra 传递「本轮待注入内容的 token」，
+    测试桩必须提供同样的接口，否则注入阶段取不到 token。
+    """
+
+    def __init__(self):
+        self._extras: dict = {}
+
+    def set_extra(self, key, value) -> None:
+        self._extras[key] = value
+
+    def get_extra(self, key=None, default=None):
+        if key is None:
+            return self._extras
+        return self._extras.get(key, default)
+
+
+def plant_pending(main_mod, plugin, event, text, images=None, age=0.0):
+    """把一条待注入内容挂到事件上（复刻 capture 阶段的 token 约定）。"""
+    token = f"tok-{id(event)}-{len(plugin._pending)}"
+    plugin._pending[token] = (text, list(images or []), monotonic() - age)
+    event.set_extra(main_mod.PENDING_EXTRA_KEY, token)
+    return token
 
 
 def install_stubs() -> None:
@@ -232,7 +260,14 @@ def main() -> int:
     check("清空后为空", cache.get() is None)
     zero = api.CookieCache(ttl=0)
     zero.put(creds)
-    check("ttl=0 表示不缓存但仍可用", zero.get() is not None)
+    check("ttl=0 表示不缓存（README/schema 的承诺）", zero.get() is None)
+    zero.put(creds)
+    zero._at -= 10**9
+    check("ttl=0 过期后自然也是空", zero.get() is None)
+    # 非法 ttl 不能抛异常：插件构造时会实例化它，而 AstrBot 只对 TypeError 重试
+    check("非法 ttl 回退默认值", api.CookieCache("abc")._ttl == api.DEFAULT_COOKIE_TTL)
+    check("None ttl 回退默认值", api.CookieCache(None)._ttl == api.DEFAULT_COOKIE_TTL)
+    check("负数 ttl 归零", api.CookieCache(-5)._ttl == 0)
 
     print("\n[8] 定位分享的那条说说")
     msglist = [
@@ -533,16 +568,16 @@ def main() -> int:
     asyncio.run(plugin.inject_qzone_content(object(), req))
     check("没有任务时不注入", req.extra_user_content_parts == [])
 
-    class Ev:
+    class Ev(_Extras):
         pass
 
     ev = Ev()
-    plugin._pending[id(ev)] = ("注入文本", ["https://img/1.jpg"])
+    plant_pending(main_mod, plugin, ev, "注入文本", ["https://img/1.jpg"])
     req2 = FakeReq()
     asyncio.run(plugin.inject_qzone_content(ev, req2))
     check("文本注入到 extra_user_content_parts", len(req2.extra_user_content_parts) == 1)
     check("图片注入到 image_urls", req2.image_urls == ["https://img/1.jpg"])
-    check("注入后清理暂存", id(ev) not in plugin._pending)
+    check("注入后清理暂存", plugin._pending == {})
 
     print("\n[10] 会话白名单")
     plugin2 = make_plugin(main_mod, api, {"group_whitelist": []})
@@ -612,8 +647,9 @@ def main() -> int:
 
     print("\n[13] 平台门禁（on_llm_request 不经过 event_filters，必须手动判断）")
 
-    class PlatEvent:
+    class PlatEvent(_Extras):
         def __init__(self, name):
+            super().__init__()
             self._name = name
 
         def get_platform_name(self):
@@ -631,11 +667,11 @@ def main() -> int:
     # 非 aiocqhttp 会话即使有待注入内容也不应注入
     plugin4 = make_plugin(main_mod, api, {})
     pev = PlatEvent("telegram")
-    plugin4._pending[id(pev)] = ("不该注入", [])
+    plant_pending(main_mod, plugin4, pev, "不该注入")
     req4 = FakeReq()
     asyncio.run(plugin4.inject_qzone_content(pev, req4))
     check("非 aiocqhttp 不注入", req4.extra_user_content_parts == [])
-    check("非 aiocqhttp 也会清掉暂存", id(pev) not in plugin4._pending)
+    check("非 aiocqhttp 也会清掉暂存", plugin4._pending == {})
 
     print("\n[14] 登录态失效检测（缓存要能被作废）")
     check("QzoneAuthError 是 RuntimeError", issubclass(api.QzoneAuthError, RuntimeError))
@@ -1018,11 +1054,13 @@ def main() -> int:
     print("\n[19] 注入流程按 context_mode 分流")
     plugin_m = make_plugin(main_mod, api, {"context_mode": "keep"})
 
-    class _Ev:
+    class _Ev(_Extras):
         pass
 
     ev_keep = _Ev()
-    plugin_m._pending[id(ev_keep)] = ("说说文本", ["https://x/a.jpg", "https://x/b.jpg"])
+    plant_pending(
+        main_mod, plugin_m, ev_keep, "说说文本", ["https://x/a.jpg", "https://x/b.jpg"]
+    )
     req_k = _Req()
     asyncio.run(plugin_m.inject_qzone_content(ev_keep, req_k))
     check("keep：图片进 req.image_urls", len(req_k.image_urls) == 2, str(req_k.image_urls))
@@ -1030,7 +1068,9 @@ def main() -> int:
 
     plugin_o = make_plugin(main_mod, api, {"context_mode": "once"})
     ev_once = _Ev()
-    plugin_o._pending[id(ev_once)] = ("说说文本", ["https://x/a.jpg", "https://x/b.jpg"])
+    plant_pending(
+        main_mod, plugin_o, ev_once, "说说文本", ["https://x/a.jpg", "https://x/b.jpg"]
+    )
     req_o = _Req()
     asyncio.run(plugin_o.inject_qzone_content(ev_once, req_o))
     check("once：图片不进 req.image_urls", req_o.image_urls == [], str(req_o.image_urls))
@@ -1118,7 +1158,7 @@ def main() -> int:
     # 否则群里一张没人 @bot 的卡片也会触发全量抓取+切片。
     pw = make_plugin(main_mod, api, {})
 
-    class _Ev:
+    class _Ev(_Extras):
         pass
 
     _MISSING = object()
@@ -1156,16 +1196,401 @@ def main() -> int:
         asyncio.run(pw.capture_qzone_share(ev_silent))
         check("未唤醒时不做任何抓取", calls["build"] == 0, str(calls))
         check("未唤醒时连链接都不解析", calls["find"] == 0, str(calls))
-        check("未唤醒时不产生待注入内容", id(ev_silent) not in pw._pending)
+        check("未唤醒时不产生待注入内容", pw._pending == {})
 
         calls["build"] = calls["find"] = 0
         ev_woke = ev_with(True)
         asyncio.run(pw.capture_qzone_share(ev_woke))
         check("被唤醒时正常抓取", calls["build"] == 1, str(calls))
-        check("被唤醒时正常产生待注入内容", id(ev_woke) in pw._pending)
+        check("被唤醒时正常产生待注入内容", len(pw._pending) == 1)
     finally:
         pw._build_payload = real_build
         pw._find_share_url = real_find
+
+    print("\n[22] 安全边界：地址白名单与凭据发送范围")
+    hostile_urls = [
+        "https://evil.example/?x=qzone.qq.com",
+        "https://evil.example/ugc/share?res_uin=10001&cellid=x&qzone.qq.com",
+        "https://qzone.qq.com.evil.example/ugc/share?a=1",
+        "https://evil.example/qzonestyle.gtimg.cn/ugc/share",
+        "看看 https://evil.example/?ref=qzone.qq.com 很有意思",
+        "https://evilqzone.qq.com/ugc/share?a=1",
+        "http://h5.qzone.qq.com/ugc/share?res_uin=10001&cellid=x",
+    ]
+    for bad in hostile_urls:
+        got_bad = api.extract_share_url(bad)
+        check(f"拒绝非 QQ空间地址: {bad[:36]}", got_bad is None, repr(got_bad))
+
+    trusted_urls = [
+        "https://h5.qzone.qq.com/ugc/share?res_uin=10001&cellid=ok",
+        "https://mobile.qzone.qq.com/l?g=1502&i=abc&u=1",
+        "https://user.qzone.qq.com/10001",
+        "https://qzonestyle.gtimg.cn/ugc/share?x=1",
+    ]
+    for good in trusted_urls:
+        check(f"接受可信地址: {good[:36]}", api.is_trusted_qzone_url(good) is True)
+    check("畸形地址不抛异常", api.is_trusted_qzone_url("https://[bad") is False)
+    check("None 不抛异常", api.is_trusted_qzone_url(None) is False)
+
+    creds_s = api.QzoneCredentials(uin=12345, skey="SK", p_skey="PK")
+    check("不传 url 时 headers() 不带 Cookie", "Cookie" not in creds_s.headers())
+    check(
+        "非白名单 url 不带 Cookie",
+        "Cookie" not in creds_s.headers(url="https://evil.example/x"),
+    )
+    check(
+        "QQ空间地址带 Cookie",
+        "Cookie" in creds_s.headers(url="https://h5.qzone.qq.com/x"),
+    )
+    check(
+        "图床 m.qpic.cn 带 Cookie（否则配图会下载失败）",
+        "Cookie" in creds_s.headers(url="https://m.qpic.cn/x"),
+    )
+    check(
+        "图床 r.photo.store.qq.com 带 Cookie",
+        "Cookie" in creds_s.headers(url="https://r.photo.store.qq.com/x"),
+    )
+
+    print("\n[22b] 跳转逐跳校验：Cookie 不会跟着跳转跑到白名单外")
+
+    class RecResp:
+        def __init__(self, status, body=b"", location=None):
+            self.status = status
+            self._body = body
+            self.headers = {"Location": location} if location else {}
+            self.url = "stub"
+
+        async def read(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class RecSession:
+        """记录每次请求的 (url, params, headers)。"""
+
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self.calls = []
+
+        def get(self, url, params=None, headers=None, **kw):
+            self.calls.append((url, params, dict(headers or {})))
+            if self._responses:
+                return self._responses.pop(0)
+            return RecResp(200, b"")
+
+    sess_h = RecSession(
+        [
+            RecResp(302, location="https://evil.example/leak"),
+            RecResp(200, b"<html>FrontPage</html>"),
+        ]
+    )
+    final_h, status_h, _body_h = asyncio.run(
+        api.fetch_trusted(
+            sess_h, "https://h5.qzone.qq.com/ugc/share?a=1", creds=creds_s
+        )
+    )
+    check("最终地址被返回（供调用方判定）", final_h == "https://evil.example/leak", final_h)
+    check("首跳在白名单内，带 Cookie", "Cookie" in sess_h.calls[0][2])
+    check(
+        "跳转目标不在白名单，第二跳不带 Cookie",
+        "Cookie" not in sess_h.calls[1][2],
+        str(sess_h.calls[1][2]),
+    )
+    check("状态码透传", status_h == 200, str(status_h))
+
+    sess_p = RecSession(
+        [RecResp(302, location="https://h5.qzone.qq.com/other"), RecResp(200, b"x")]
+    )
+    asyncio.run(
+        api.fetch_trusted(
+            sess_p,
+            "https://h5.qzone.qq.com/ugc/share",
+            params={"uin": "1", "g_tk": "9"},
+            creds=creds_s,
+        )
+    )
+    check("首跳携带原始 query", sess_p.calls[0][1] == {"uin": "1", "g_tk": "9"})
+    check("跳转后不再携带原始 query（避免 uin/g_tk 外泄）", sess_p.calls[1][1] is None)
+    check("跳到可信主机仍带 Cookie", "Cookie" in sess_p.calls[1][2])
+
+    sess_x = RecSession(
+        [
+            RecResp(302, location="https://evil.example/leak"),
+            RecResp(200, b"<html>var FrontPage = {\"data\":{}};</html>"),
+        ]
+    )
+    check(
+        "分享页跳到非白名单地址时不接受内容",
+        asyncio.run(
+            api._get_html(sess_x, "https://h5.qzone.qq.com/ugc/share?a=1", creds_s)
+        )
+        == "",
+    )
+
+    sess_ok = RecSession(
+        [
+            RecResp(302, location="https://h5.qzone.qq.com/ugc/share/?a=1"),
+            RecResp(200, "<html>FrontPage".encode("utf-8")),
+        ]
+    )
+    check(
+        "分享页跳到可信地址时内容被接受",
+        "FrontPage"
+        in asyncio.run(
+            api._get_html(sess_ok, "https://h5.qzone.qq.com/ugc/share?a=1", creds_s)
+        ),
+    )
+
+    sess_loop = RecSession([RecResp(302, location="https://h5.qzone.qq.com/loop")] * 12)
+    final_l, status_l, body_l = asyncio.run(
+        api.fetch_trusted(
+            sess_loop, "https://h5.qzone.qq.com/ugc/share", creds=creds_s, max_hops=2
+        )
+    )
+    check("跳数超限时返回 0 + 空响应体", status_l == 0 and body_l == b"", str(status_l))
+
+    class _RecLogger:
+        def __init__(self):
+            self.warnings = []
+
+        def warning(self, msg, *args):
+            self.warnings.append(msg % args if args else msg)
+
+        def info(self, *a, **k):
+            pass
+
+        def debug(self, *a, **k):
+            pass
+
+    real_logger = api.logger
+    recorder = _RecLogger()
+    api.logger = recorder
+    try:
+        asyncio.run(
+            api._get_text(RecSession([RecResp(500)]), api.LIST_URL, creds_s, {"uin": "1"})
+        )
+        asyncio.run(
+            api._get_html(
+                RecSession([RecResp(500)]), "https://h5.qzone.qq.com/ugc/share", creds_s
+            )
+        )
+    finally:
+        api.logger = real_logger
+    check(
+        "HTTP 状态码仍会被告警（保留原有排障线索）",
+        any("HTTP 500" in w for w in recorder.warnings),
+        str(recorder.warnings),
+    )
+
+    print("\n[22c] 入口门禁：非白名单地址不发任何请求")
+    holder: dict = {}
+
+    class _NeverSession:
+        def __init__(self, **kw):
+            self.calls = 0
+
+        def get(self, *a, **kw):
+            self.calls += 1
+            raise AssertionError("不应该发起任何请求")
+
+    real_session = api.aiohttp.ClientSession
+
+    def _never_factory(**kw):
+        holder["s"] = _NeverSession(**kw)
+        return holder["s"]
+
+    api.aiohttp.ClientSession = _never_factory
+    try:
+        got_never = asyncio.run(
+            api.fetch_post(creds_s, "https://evil.example/?x=qzone.qq.com")
+        )
+    finally:
+        api.aiohttp.ClientSession = real_session
+    check("非白名单分享地址直接放弃", got_never is None)
+    check("连 ClientSession 都没有创建，自然没有发请求", "s" not in holder, str(holder))
+
+    print("\n[22d] 健壮性：非法配置与抓取异常都不该打断对话")
+    p_bad = make_plugin(
+        main_mod,
+        api,
+        {
+            "cookie_ttl": "abc",
+            "max_images": "4张",
+            "image_max_width": "abc",
+            "slice_max_height": None,
+            "jpeg_quality": [],
+        },
+    )
+    check("非法配置下插件仍能构造", p_bad is not None)
+    check("cookie_ttl 非法值回退默认", p_bad.cookies._ttl == api.DEFAULT_COOKIE_TTL)
+    check("max_images 非法值回退默认 4", p_bad._bounded_int("max_images", 4) == 4)
+    check(
+        "max_images 负数归零",
+        make_plugin(main_mod, api, {"max_images": -3})._bounded_int("max_images", 4) == 0,
+    )
+    check(
+        "max_images=0 仍然表示不带图",
+        make_plugin(main_mod, api, {"max_images": 0})._bounded_int("max_images", 4) == 0,
+    )
+    check(
+        "image_max_width 非法值回退 1024",
+        p_bad._int_config("image_max_width", 1024, allow_zero=True) == 1024,
+    )
+    check(
+        "jpeg_quality 非法值回退 88",
+        p_bad._int_config("jpeg_quality", 88) == 88,
+    )
+
+    p_boom = make_plugin(main_mod, api, {})
+
+    async def _boom(event, url):
+        raise RuntimeError("boom")
+
+    p_boom._build_payload = _boom
+    p_boom._find_share_url = lambda event: "https://h5.qzone.qq.com/ugc/share?res_uin=1&cellid=x"
+
+    class _WakeEv(_Extras):
+        is_at_or_wake_command = True
+
+    ev_boom = _WakeEv()
+    asyncio.run(p_boom.capture_qzone_share(ev_boom))
+    check("抓取阶段异常不冒泡（否则整条消息会被 stop_event）", p_boom._pending == {})
+
+    print("\n[22e] 图片覆盖张数：不能把切片块数说成原图张数")
+    if has_pil:
+        post_cover = api.QzonePost(
+            uin=1,
+            name="转发者",
+            text="评语",
+            original_name="原作者",
+            original_uin=2,
+            original_text="原文",
+            original_images=["http://x/A.jpg", "http://x/B.jpg"],
+        )
+        blocks_cover, covered_cover = asyncio.run(
+            api.images.prepare_images_with_coverage(
+                _Session(tall),
+                list(post_cover.original_images),
+                budget=4,
+                slice_tall=True,
+            )
+        )
+        check("预算 4 只覆盖到第 1 张原图", covered_cover == 1, str(covered_cover))
+        check("切片块数仍受预算约束", len(blocks_cover) == 4, str(len(blocks_cover)))
+        rendered_cover = post_cover.to_prompt(
+            max_images=len(blocks_cover), covered_images=covered_cover
+        )
+        check("渲染如实说明只附带 1 张", "已附带前 1 张" in rendered_cover)
+        check("不再谎称附带 2 张", "已附带前 2 张" not in rendered_cover)
+        check(
+            "prepare_images 仍返回纯列表（兼容旧调用）",
+            isinstance(
+                asyncio.run(
+                    api.images.prepare_images(
+                        _Session(tall), ["http://x/1.jpg"], budget=4, slice_tall=True
+                    )
+                ),
+                list,
+            ),
+        )
+        check(
+            "超宽图也计入覆盖张数",
+            asyncio.run(
+                api.images.prepare_images_with_coverage(
+                    _Session(make_image(1200, 900)),
+                    ["http://x/wide.jpg"],
+                    budget=4,
+                    slice_tall=True,
+                )
+            )[1]
+            == 1,
+        )
+        check(
+            "预算为 0 时覆盖张数为 0",
+            asyncio.run(
+                api.images.prepare_images_with_coverage(
+                    _Session(tall), ["http://x/1.jpg"], budget=0, slice_tall=True
+                )
+            )
+            == ([], 0),
+        )
+
+    print("\n[22f] 定位与候选地址")
+    check("裸 uin 不再被当作定位信息", api._extract_host_uin({"uin": "30003"}) is None)
+    check("裸 uin 的链接不算有定位信息", api._has_feed_locator({"uin": "30003"}) is False)
+    check("host_uin 仍然可用", api._extract_host_uin({"host_uin": "10001"}) == 10001)
+
+    cand1 = api._share_page_candidates("https://h5.qzone.qq.com/ugc/share?a=1")
+    cand2 = api._share_page_candidates("https://h5.qzone.qq.com/ugc/share/?a=1")
+    cand3 = api._share_page_candidates("https://h5.qzone.qq.com/ugc/share/")
+    check(
+        "补出带斜杠的等价候选",
+        cand1 == ["https://h5.qzone.qq.com/ugc/share?a=1", "https://h5.qzone.qq.com/ugc/share/?a=1"],
+        str(cand1),
+    )
+    check(
+        "补出不带斜杠的等价候选",
+        cand2 == ["https://h5.qzone.qq.com/ugc/share/?a=1", "https://h5.qzone.qq.com/ugc/share?a=1"],
+        str(cand2),
+    )
+    check(
+        "无 query 时补出不带斜杠的候选",
+        cand3 == ["https://h5.qzone.qq.com/ugc/share/", "https://h5.qzone.qq.com/ugc/share?"],
+        str(cand3),
+    )
+    check(
+        "不会产出 ?? 畸形地址",
+        all("??" not in item for item in [*cand1, *cand2, *cand3]),
+    )
+
+    print("\n[22g] 待注入内容用事件 token 索引，不再用 id(event)")
+    p_tok = make_plugin(main_mod, api, {})
+    ev_a = _Ev()
+    plant_pending(main_mod, p_tok, ev_a, "A 的内容")
+    req_a = _Req()
+    asyncio.run(p_tok.inject_qzone_content(ev_a, req_a))
+    check("token 约定下正常注入", len(req_a.extra_user_content_parts) == 1)
+    check("注入后条目被清除", p_tok._pending == {})
+
+    ev_none = _Ev()
+    req_none = _Req()
+    asyncio.run(p_tok.inject_qzone_content(ev_none, req_none))
+    check("没有 token 的事件不会拿到旧内容", req_none.extra_user_content_parts == [])
+
+    ev_ghost = _Ev()
+    ev_ghost.set_extra(main_mod.PENDING_EXTRA_KEY, "不存在的 token")
+    req_ghost = _Req()
+    asyncio.run(p_tok.inject_qzone_content(ev_ghost, req_ghost))
+    check("token 对不上时不注入", req_ghost.extra_user_content_parts == [])
+
+    ev_c, ev_d = _Ev(), _Ev()
+    plant_pending(main_mod, p_tok, ev_c, "C 的内容")
+    plant_pending(main_mod, p_tok, ev_d, "D 的内容")
+    req_c, req_d = _Req(), _Req()
+    asyncio.run(p_tok.inject_qzone_content(ev_c, req_c))
+    asyncio.run(p_tok.inject_qzone_content(ev_d, req_d))
+    check(
+        "两条消息的内容不会互相串",
+        req_c.extra_user_content_parts[0].text == "C 的内容"
+        and req_d.extra_user_content_parts[0].text == "D 的内容",
+    )
+
+    p_ttl = make_plugin(main_mod, api, {})
+    ev_old = _Ev()
+    plant_pending(main_mod, p_ttl, ev_old, "过期的内容", age=main_mod.PENDING_TTL + 1)
+    req_old = _Req()
+    asyncio.run(p_ttl.inject_qzone_content(ev_old, req_old))
+    check("过期内容不会被注入", req_old.extra_user_content_parts == [])
+    check("过期条目已被回收", p_ttl._pending == {})
+
+    ev_fresh = _Ev()
+    plant_pending(main_mod, p_ttl, ev_fresh, "新鲜的内容")
+    p_ttl._sweep_pending()
+    check("未过期条目不会被顺手清掉", len(p_ttl._pending) == 1)
 
     print("\n" + "=" * 56)
     print(f"通过 {passed} 项，失败 {len(failed)} 项")
@@ -1173,7 +1598,7 @@ def main() -> int:
         for name in failed:
             print(f"  - {name}")
         return 1
-    print("全部通过 ✅")
+    print("全部通过")
     return 0
 
 

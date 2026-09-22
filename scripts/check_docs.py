@@ -251,7 +251,7 @@ def main() -> int:
         for item in problems:
             print(f"  - {item}")
         return 1
-    print("文档与代码一致 ✅")
+    print("文档与代码一致")
     return 0
 
 
