@@ -644,11 +644,20 @@ class QzoneReaderPlugin(Star):
         return (getattr(event, "message_str", "") or "").strip()
 
     def _in_scope(self, event: AstrMessageEvent) -> bool:
+        """会话白名单：只有列在里面的会话才干活。
+
+        比较的是 AstrBot 的会话 ID（`unified_msg_origin`），格式为
+        `platform_id:消息类型:session_id`，例如 `aiocqhttp:GroupMessage:123456789`
+        —— 就是 WebUI「会话管理」页面里显示的那串，直接从那里复制即可。
+        比较时忽略大小写与首尾空格；取不到会话 ID 时按「不在白名单」处理：
+        白名单是限制性配置，宁可不动，也不该在别处乱动。
+        """
         whitelist = self.config.get("group_whitelist") or []
         if not whitelist:
             return True
-        try:
-            session_id = str(event.get_group_id() or event.get_sender_id() or "")
-        except Exception:  # noqa: BLE001
-            return True
-        return session_id in {str(item) for item in whitelist}
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            logger.debug("[qzone_reader] 取不到会话 ID（UMO），按不在白名单处理")
+            return False
+        allowed = {str(item).strip().lower() for item in whitelist}
+        return str(umo).strip().lower() in allowed

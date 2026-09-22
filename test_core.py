@@ -579,22 +579,42 @@ def main() -> int:
     check("图片注入到 image_urls", req2.image_urls == ["https://img/1.jpg"])
     check("注入后清理暂存", plugin._pending == {})
 
-    print("\n[10] 会话白名单")
+    print("\n[10] 会话白名单（比对 AstrBot 的会话 ID / UMO）")
     plugin2 = make_plugin(main_mod, api, {"group_whitelist": []})
 
     class E2:
-        def get_group_id(self):
-            return "111"
+        """只提供 unified_msg_origin 的最小事件桩。"""
 
-        def get_sender_id(self):
-            return "222"
+        def __init__(self, umo=""):
+            self.unified_msg_origin = umo
+
+    GROUP_UMO = "aiocqhttp:GroupMessage:111"
+    FRIEND_UMO = "aiocqhttp:FriendMessage:222"
 
     plugin2.config = {"group_whitelist": []}
-    check("白名单为空时全部生效", plugin2._in_scope(E2()) is True)
-    plugin2.config = {"group_whitelist": ["111"]}
-    check("命中群号生效", plugin2._in_scope(E2()) is True)
-    plugin2.config = {"group_whitelist": ["999"]}
-    check("未命中则不生效", plugin2._in_scope(E2()) is False)
+    check("白名单为空时全部生效", plugin2._in_scope(E2(GROUP_UMO)) is True)
+
+    plugin2.config = {"group_whitelist": [GROUP_UMO]}
+    check("命中会话 ID 生效", plugin2._in_scope(E2(GROUP_UMO)) is True)
+    check("同群的私聊会话不受影响", plugin2._in_scope(E2(FRIEND_UMO)) is False)
+
+    plugin2.config = {"group_whitelist": [GROUP_UMO, FRIEND_UMO]}
+    check("群聊与私聊可同时填", plugin2._in_scope(E2(FRIEND_UMO)) is True)
+    plugin2.config = {"group_whitelist": ["  " + GROUP_UMO + "  "]}
+    check("配置值两侧带空格也能命中", plugin2._in_scope(E2(GROUP_UMO)) is True)
+    check("事件侧带空格也能命中", plugin2._in_scope(E2(" " + GROUP_UMO + " ")) is True)
+    check("大小写不敏感", plugin2._in_scope(E2("AIOCQHTTP:groupmessage:111")) is True)
+
+    plugin2.config = {"group_whitelist": ["aiocqhttp:GroupMessage:999"]}
+    check("未命中则不生效", plugin2._in_scope(E2(GROUP_UMO)) is False)
+    check(
+        "纯群号不再生效（口径已改为 UMO）",
+        plugin2._in_scope(E2("111")) is False,
+    )
+    check(
+        "取不到会话 ID 时不生效（fail-closed）",
+        plugin2._in_scope(object()) is False,
+    )
     print("\n[11] 卡片识别（Json 组件 + 纯文本 + raw 兜底）")
     from types import SimpleNamespace
 

@@ -86,7 +86,7 @@ astrbot_plugin_qzone_reader/
 ① 消息事件
    capture_qzone_share(event)          ← 整体包在 try/except 里（异常绝不能冒泡）
      ├─ _sweep_pending()              回收过期暂存
-     ├─ _in_scope(event)              会话白名单
+     ├─ _in_scope(event)              会话白名单（比对 UMO，见「测试」与 API 表）
      ├─ _find_share_url(event)        识别链接
      │    ├─ Comp.Json.data           ← 主路径（分享卡片）
      │    ├─ Comp.Plain 文本          ← 直接粘贴链接
@@ -192,7 +192,7 @@ fetch_post(creds, share_url)
 | `_find_share_url(event)` | 从消息链找分享链接（含被引用消息） |
 | `_scan_chain(chain, depth)` | **递归**扫描消息链，返回 `(链接, 降级文案片段)`；处理 `Reply.chain` |
 | `_card_text(event)` | 复用 `_scan_chain` 取降级文案 |
-| `_in_scope(event)` | 会话白名单判断 |
+| `_in_scope(event)` | 会话白名单判断：比对 `event.unified_msg_origin`（AstrBot 的会话 ID，`platform:消息类型:session_id`），忽略大小写与首尾空格；取不到会话 ID 时按「不在白名单」处理（fail-closed） |
 | `_summarize_mode()` | 解析 `summarize_mode`，返回 `off` / `brief` / `full`；兼容旧键 `auto_summarize`，非法值回退 `brief` |
 | `_keep_in_context()` | 解析 `context_mode`，`keep` 返回 `True`，`once` 返回 `False` |
 | `_with_instruction(body, mode)` | 按模式决定是否给正文加指令前缀 |
@@ -683,7 +683,7 @@ cd astrbot_plugin_qzone_reader
 python test_core.py
 ```
 
-当前 **297 项断言**。分段：
+当前 **304 项断言**。分段：
 
 | 段 | 覆盖 |
 | --- | --- |
@@ -692,7 +692,7 @@ python test_core.py
 | `[7]` | Cookie 缓存 TTL |
 | `[8]` `[8b]` `[8c]` | 说说定位、短链参数识别、**认不出时必须放弃**（安全回归） |
 | `[8d]` | **转发：必须读到原文**，且不重复渲染 |
-| `[9]`–`[13]` | 插件组装、白名单、卡片识别、转义还原、平台门禁 |
+| `[9]`–`[13]` | 插件组装、**会话白名单（UMO 口径）**、卡片识别、转义还原、平台门禁 |
 | `[14]`–`[15]` | 登录态失效检测与自动重取 |
 | `[16]` | **长截图切片**：尺寸判定、切片尺寸、预算约束、降级路径 |
 | `[17]` | 配置项接线（含「已移除硬上限」的断言） |
@@ -845,6 +845,8 @@ print(cell.keys() if cell else "解析失败")
 | **`CREDENTIAL_HOSTS` 取自两份真实样本** | 白名单来自 fixture 里的 `m.qpic.cn` / `r.photo.store.qq.com`。真实 feed 若用了列表外的图床，那些图会**不带登录态**去下载（行为是退回原 URL，不会崩），需要按日志补域名 |
 | **1280–1599 高的长截图不切片** | 低于 `DEFAULT_TALL_THRESHOLD=1600`，会交给 AstrBot 按长边上限缩放（宽度损失约 2%~20%）。改成按 1280 切片能保住宽度，但每张会多出一个 80~300px 的碎块并多占一个图片额度，实测不划算，故保留现状 |
 | **`_bounded_int` 的非法值语义变化** | 非法 `image_max_width` 从「0 = 不缩放」改为「回退默认 1024」，非法 `max_images` 从 0 改为 4 —— 即非法值不再静默关掉功能，而是回到 schema 默认值。`[22d]` 段钉住了新语义 |
+| **会话白名单口径是 UMO** | `group_whitelist` 比对 `event.unified_msg_origin`。注意 AstrBot 开了 `platform_settings.unique_session` 时会话 ID 会变成 `platform:类型:{sender}_{group}`，同一群里每个成员都是独立会话 —— 此时「按群」填的条目匹配不上。另外平台 id / 消息类型区分大小写，代码里已做 `lower()` 容错，但 webchat 这类把用户名编进 session_id 的平台理论上存在大小写不同的两个会话被同一配置命中的可能（本插件只服务 aiocqhttp，session_id 是数字，实际不会触发） |
+| **白名单取不到会话 ID 时 fail-closed** | 老实现是「取不到就放行」，现在按「不在白名单」处理。真实 AstrBot 事件一定有 `unified_msg_origin`，只影响测试桩或极老版本 |
 | **跳转链共用一个总超时** | `fetch_trusted` 用 `total_timeout` 给整条链计时，不再每跳重新计时；跳数上限取 aiohttp 默认的 10 |
 | 分享页可能返回登录页 | 此时 `FrontPage` 仍在但 `data` 为空，会落到列表接口兜底 |
 | 视频 | 只记录数量，未解析。`cell_video()` 已能取地址，但未接入注入 |

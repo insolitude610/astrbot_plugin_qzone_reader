@@ -112,7 +112,7 @@ QQ空间没有开放接口，读取说说需要账号 Cookie。插件按以下�
 | `jpeg_quality` | `88` | 切片/缩放后的 JPEG 质量（1-95）。调低明显减体积，代价是小字变糊 |
 | `context_mode` | `"keep"` | 上下文保留，见下文 |
 | `summarize_mode` | `"brief"` | 总结模式，见下文 |
-| `group_whitelist` | `[]` | 只在这些会话生效（群号/QQ号），留空表示全部会话 |
+| `group_whitelist` | `[]` | 只在这些会话生效。填 **AstrBot 的会话 ID（UMO）**，如 `aiocqhttp:GroupMessage:123456789`，从 WebUI「会话管理」页面复制；留空表示全部会话 |
 | `notify_on_failure` | `true` | 读不到正文时是否告知用户。关闭则静默降级，只把卡片文字交给模型且不提失败 |
 
 ### 上下文保留 `context_mode`
@@ -318,7 +318,7 @@ B. 这是归纳总结，不是把原文缩写一遍。要按条理用自己的�
 | bot 说读不到内容 | 多为登录态失效，按第一行处理 |
 | 总结里没有图片内容 | 模型不支持图片输入时，`context_mode=keep` 下 AstrBot 会把图片换成 `[Image]` 占位并跳过。注意 **`once` 模式下图片走的是额外内容块，AstrBot 的模态过滤管不到它** —— 如果当前模型不支持视觉，请把 `max_images` 设为 `0`，否则可能直接被 provider 拒绝 |
 | 日志出现 `非 QQ空间域名，拒绝读取` | 链接的域名不在白名单内（只接受 `https` 的 `*.qzone.qq.com` 与 `qzonestyle.gtimg.cn`）。这是安全门禁，不是故障 |
-| 只在某些群生效 | 用 `group_whitelist` 填群号 |
+| 只在某些会话生效 | 用 `group_whitelist` 填**会话 ID（UMO）**，如 `aiocqhttp:GroupMessage:123456789`，从 WebUI「会话管理」页面复制。填群号不生效（口径是 AstrBot 的会话 ID，不是群号） |
 | 群聊里 @bot 没反应 | 确认确实 @ 到了 bot（或被唤醒前缀命中）。日志里没有 `检测到 QQ空间分享` 就说明插件没被触发，问题在唤醒环节 |
 | 引用卡片后没反应 | 日志里搜 `检测到 QQ空间分享`。没有则说明协议端没取回被引用的原消息（原消息可能已删除），改用直接转发 |
 | 不想每次都被回「没读到」 | 把 `notify_on_failure` 设为 `false` |
@@ -333,6 +333,7 @@ B. 这是归纳总结，不是把原文缩写一遍。要按条理用自己的�
 - **只接受 `https` 的 QQ空间分享链接**（`*.qzone.qq.com`、`qzonestyle.gtimg.cn`）。这是刻意的安全门禁：插件会带着账号 Cookie 去请求这些地址，所以必须按解析后的 hostname 做白名单，而不是「URL 里出现 qzone.qq.com 就算」。Cookie 也只会发给 `*.qzone.qq.com`、`*.qpic.cn`、`*.qlogo.cn`、`*.gtimg.cn`、`*.photo.store.qq.com` 这些域名。
 - 跳转是**逐跳校验**的：如果某个可信地址把你跳到白名单外的域名，那一跳不会带 Cookie，内容也不会被采信。残余风险是「白名单内的域名之间互相跳转仍然带 Cookie」，以及 Referer / Origin 头始终带有你的 QQ 号（配图床需要它，没有一起收紧）。
 - 只带 `uin=` 的链接（没有 `res_uin`/`cellid`）在分享页解析失败时**不会被拿去猜**：以前会去那个 uin 的动态列表里按时间戳找，可能读到无关的说说，现在直接放弃。
+- `group_whitelist` 比对的是 **AstrBot 的会话 ID（UMO）**，不是群号。若开了 `platform_settings.unique_session`，会话 ID 会带上发送者（`aiocqhttp:GroupMessage:10001_123456789`），按群填的条目会匹配不上 —— 按「会话管理」页面里实际显示的那串填。
 - 群聊里**必须 @bot 或带唤醒前缀**才会响应，这是 AstrBot 的通用唤醒规则。没被唤醒时插件**不会做任何抓取**（不抓页面、不下载图片），不会白白消耗资源。
 - 引用分享卡片时依赖协议端能取回被引用的原消息（AstrBot 的 `get_reply` 默认开启）。若原消息已被删除或 `get_msg` 失败，引用方式就读不到。
 - 只能读取**你的账号有权限看到**的内容；登录态失效时读不到好友可见的说说。

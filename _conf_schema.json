@@ -71,7 +71,7 @@
   "group_whitelist": {
     "description": "生效会话白名单",
     "type": "list",
-    "hint": "填写会话 ID（群号或用户 QQ）。留空表示所有会话都生效。",
+    "hint": "填 AstrBot 的会话 ID（UMO），格式为 platform:消息类型:session_id，例如 aiocqhttp:GroupMessage:123456789 或 aiocqhttp:FriendMessage:10001 —— 与 WebUI「会话管理」页面里显示的一致，直接从那里复制即可（不区分大小写，首尾空格会被忽略）。留空表示所有会话都生效。注意两点：① 这里不是纯群号，填群号不会生效；② 如果开了 AstrBot 的 platform_settings.unique_session，会话 ID 会带上发送者（形如 aiocqhttp:GroupMessage:10001_123456789），此时按群填的条目匹配不上，需要按实际显示的会话 ID 填。",
     "default": []
   },
   "notify_on_failure": {
