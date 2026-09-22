@@ -42,10 +42,31 @@ astrbot_plugin_qzone_reader/
 │   └── repost_cell.json       # 脱敏后的转发说说数据，供回归测试用
 ├── scripts/
 │   └── check_docs.py          # 文档一致性检查（见「测试」）
+├── assets/
+│   └── logo.gif               # README 头图（动图）
+├── logo.png                   # AstrBot WebUI 里显示的插件图标（有讲究，见下）
 ├── test_core.py               # 自测脚本（无 AstrBot 依赖，见「测试」）
 ├── _conf_schema.json          # 配置项定义
+├── LICENSE                    # MIT
 └── metadata.yaml              # 插件元数据
 ```
+
+### 图标与头图
+
+两个文件名都**不能随便改**：
+
+- `logo.png` —— AstrBot 在 WebUI 的插件列表/详情页里显示它，而文件名在
+  `astrbot/core/star/star_manager.py:213` 里**硬编码**为 `logo.png`
+  （`self.logo_fname = "logo.png"`，加载时 `os.path.exists` 命中才挂上 `metadata.logo_path`）。
+  想换图标就得叫这个名字。dashboard 通过 `/api/files/tokens/<token>` 直接 `FileResponse`
+  这个文件、**没有加 `X-Content-Type-Options: nosniff`**，所以它按扩展名报
+  `image/png`、内容却是 GIF89a 时，浏览器仍会按内容嗅探并**播放动画** ——
+  这就是「让 WebUI 里显示动图」能成立的原因（已用真实浏览器验证：
+  两次截图只在该图标区域内不同）。若哪天 AstrBot 给这条响应加上 nosniff，
+  这个做法会失效，届时得把 `logo.png` 换成真正的 PNG 静态图。
+- `assets/logo.gif` —— README 头图与 GitHub 页面用，保持 `.gif` 后缀以免被当成静态 PNG。
+
+两者目前是同一个文件的副本（源文件 200×200、17 帧）。
 
 职责边界：
 

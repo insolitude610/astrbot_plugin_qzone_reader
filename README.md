@@ -1,8 +1,20 @@
+<div align="center">
+
+<img src="assets/logo.gif" width="150" alt="astrbot_plugin_qzone_reader">
+
 # astrbot_plugin_qzone_reader
 
 把 QQ空间说说转发给 bot，自动读取、总结，并且**内容会进入会话历史**，之后可以继续追问讨论。
 
 不需要任何指令 —— 转发动作本身就是触发条件。
+
+[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-orange?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
+[![Platform](https://img.shields.io/badge/Platform-aiocqhttp%20%2F%20NapCat-2496ED?style=flat-square)](#已知限制)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+
+</div>
+
+---
 
 ## 为什么需要它
 
