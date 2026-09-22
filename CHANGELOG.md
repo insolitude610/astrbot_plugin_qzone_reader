@@ -43,8 +43,9 @@
 
 ### 文档
 
-- README 增加头图（动图）与徽章；补 `LICENSE`（MIT）与 `logo.png`（AstrBot WebUI 里
-  显示的插件图标，文件名由 AstrBot 固定）。
+- README 增加头图（动图）与徽章；补 `LICENSE`（MIT）与 `logo.png`
+  —— 后者同时作为 AstrBot WebUI 的插件图标和**插件市场头图**（文件名由 AstrBot 固定，
+  内容为 APNG：真正的 PNG，且保留动画）。
 - 说明 `slice_max_height` / `image_max_width` 受 AstrBot 图片长边上限
   （`image_compress_options.max_size`，默认 1280）影响；`once` 模式 + 非视觉模型
   仍会发出图片块等细节。

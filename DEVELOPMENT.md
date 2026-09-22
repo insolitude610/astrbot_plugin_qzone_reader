@@ -44,7 +44,7 @@ astrbot_plugin_qzone_reader/
 │   └── check_docs.py          # 文档一致性检查（见「测试」）
 ├── assets/
 │   └── logo.gif               # README 头图（动图）
-├── logo.png                   # AstrBot WebUI 里显示的插件图标（有讲究，见下）
+├── logo.png                   # 插件图标 / 市场头图（APNG：真 PNG + 动画，见下）
 ├── test_core.py               # 自测脚本（无 AstrBot 依赖，见「测试」）
 ├── _conf_schema.json          # 配置项定义
 ├── LICENSE                    # MIT
@@ -53,20 +53,66 @@ astrbot_plugin_qzone_reader/
 
 ### 图标与头图
 
-两个文件名都**不能随便改**：
+两个文件名都**不能随便改**，而且 `logo.png` **必须是真正的 PNG**：
 
-- `logo.png` —— AstrBot 在 WebUI 的插件列表/详情页里显示它，而文件名在
-  `astrbot/core/star/star_manager.py:213` 里**硬编码**为 `logo.png`
-  （`self.logo_fname = "logo.png"`，加载时 `os.path.exists` 命中才挂上 `metadata.logo_path`）。
-  想换图标就得叫这个名字。dashboard 通过 `/api/files/tokens/<token>` 直接 `FileResponse`
-  这个文件、**没有加 `X-Content-Type-Options: nosniff`**，所以它按扩展名报
-  `image/png`、内容却是 GIF89a 时，浏览器仍会按内容嗅探并**播放动画** ——
-  这就是「让 WebUI 里显示动图」能成立的原因（已用真实浏览器验证：
-  两次截图只在该图标区域内不同）。若哪天 AstrBot 给这条响应加上 nosniff，
-  这个做法会失效，届时得把 `logo.png` 换成真正的 PNG 静态图。
-- `assets/logo.gif` —— README 头图与 GitHub 页面用，保持 `.gif` 后缀以免被当成静态 PNG。
+- `logo.png` —— 两处都在用它：
+  1. AstrBot WebUI 的插件列表/详情页。文件名在 `astrbot/core/star/star_manager.py:213`
+     里**硬编码**为 `logo.png`（`self.logo_fname = "logo.png"`，加载时 `os.path.exists`
+     命中才挂上 `metadata.logo_path`），想换图标就得叫这个名字；
+  2. **插件市场的头图**。官方文档（`docs/zh/dev/star/plugin.md:226`）写明：在插件目录下
+     放 `logo.png` 作为插件的 Logo 显示在插件市场中，1:1，推荐 256×256。
+- `assets/logo.gif` —— 只给 README / GitHub 页面用，保持 `.gif` 后缀。
 
-两者目前是同一个文件的副本（源文件 200×200、17 帧）。
+#### 为什么是 APNG，而不是「GIF 改名成 .png」
+
+动图图标必须同时满足两件事：**文件真的是 PNG**，并且**仍然会动**。
+早期版本把 GIF 字节直接命名成 `logo.png`，靠浏览器按内容嗅探来播放 ——
+本地 WebUI 确实能显示，但市场/Cloud 那条采集与校验管线按扩展名/魔数处理图片时
+就可能把它丢掉（表现：市场里的头图是空的）。
+
+正确做法是 **APNG**（Animated PNG）：魔数就是 PNG 签名，`PIL.Image.open()` 识别为
+`format=PNG`，同时带 `acTL`/`fcTL`/`fdAT` 块承载动画，浏览器（Chrome / Firefox / Safari）
+都会播放。这个仓库里另外两个插件已经这么做了，可用作参照：
+
+| 插件 | 实际格式 | 尺寸 | 帧数 | 体积 |
+| --- | --- | --- | --- | --- |
+| `astrbot_plugin_roll`（本仓库外的姊妹插件） | APNG | 240×240 RGBA | 32 | 239 KB |
+| `astrbot_plugin_text_voice_lang_split` | APNG | 140×140 RGBA | 19 | 681 KB |
+| 本插件 | APNG | 200×200 RGBA | 17 | 457 KB |
+
+（可见 256×256 只是"推荐"，140×140 也在用；本插件保留源图的 200×200，避免上采样变糊。）
+
+#### 重新生成 `logo.png`
+
+源动图在仓库外（`astrbot娘震惊.gif`，200×200、17 帧、30ms/帧）。用 Pillow 直接写 APNG：
+
+```python
+from PIL import Image, ImageSequence
+
+with Image.open("astrbot娘震惊.gif") as src:
+    frames, durations = [], []
+    for fr in ImageSequence.Iterator(src):
+        frames.append(fr.convert("RGBA"))            # 保留透明通道
+        durations.append(int(fr.info.get("duration", 30)))
+
+frames[0].save("logo.png", format="PNG", save_all=True,
+               append_images=frames[1:], duration=durations,
+               loop=0, disposal=2, optimize=True)
+```
+
+写完后按这三条自检（缺一不可）：
+
+```python
+data = open("logo.png", "rb").read()
+assert data[:8] == b"\x89PNG\r\n\x1a\n"       # 真的是 PNG
+im = Image.open("logo.png")
+assert im.format == "PNG" and im.n_frames > 1 # PIL 认它是 PNG，且是多帧
+assert b"acTL" in data                        # 带 APNG 动画控制块
+```
+
+注意：调色板（P 模式）帧会让 Pillow 的 APNG 写入器在 `disposal=1/2` 时报
+`ValueError: images do not match`（不同帧的调色板无法叠起来），所以这里统一用 RGBA。
+把源图放大到 256×256 会让体积涨到 1.3 MB 以上且更糊，因此保持 200×200。
 
 职责边界：
 
