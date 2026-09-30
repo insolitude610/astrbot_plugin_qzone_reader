@@ -212,8 +212,9 @@ B. 这是归纳总结，不是把原文缩写一遍。要按条理用自己的�
 ② 取登录态   NapCat get_cookies → 手动 Cookie
       │
       ▼
-③ 短链解析   跟随 302 跳转到 h5.qzone.qq.com/ugc/share
-      │        拿到 res_uin / cellid
+③ 短链解析   跟随 302 拿最终地址与 res_uin / cellid
+      │        （QQ 给的地址若写成明文 http，先把 QQ空间主机升级成 https：
+      │         凭据只走 https，不升级就等于匿名请求，会被踢到登录页）
       ▼
 ④ 读分享页   解析页面内嵌的 FrontPage 数据
       │        cell_summary 正文 · cell_pic 配图 · cell_original 被转发的原文
@@ -243,6 +244,8 @@ B. 这是归纳总结，不是把原文缩写一遍。要按条理用自己的�
 - 引用分享卡片时依赖协议端能取回被引用的原消息（AstrBot 的 `get_reply` 默认开启）。若原消息已被删除或 `get_msg` 失败，引用方式就读不到。
 - 只能读取**你的账号有权限看到**的内容；登录态失效时读不到好友可见的说说。
 - 分享页对部分权限较严的说说可能不返回数据，此时会退回列表接口；两条路都失败则降级为卡片文字。
+- **纯文字说说走的是另一套分享链接**（卡片 `bizsrc=qzone.shuoshuoshareonlytext`，链接形如 `mobile.qzone.qq.com/l?g=1336&…ciphertext=…`）。这种页面里内嵌的跳转地址可能是**明文 http**，插件会先把 QQ空间主机的 scheme 升级成 https 再抓 —— 只改 scheme，主机白名单和「Cookie 只发 https」的规则都不变（v1.0.2 修的就是这一步：不升级就带不上登录态，QQ 会把请求当匿名处理并跳到登录页，正文读不到）。
+- QQ 卡片自带的 `desc` 摘要**本来就是腾讯截断过的**（以 `...` 结尾）。万一正文读取失败、降级用卡片文字，模型也只能看到这段开头 —— 这是降级路径的固有限制，不是插件在截断。
 - 视频只记录「含视频 N 个」，不解析视频内容。
 - **AstrBot 自身有图片长边上限**（`provider_settings.image_compress_options.max_size`，默认 1280）：符合上限的 JPEG/PNG 会原样透传（所以插件的 `jpeg_quality` 是有效的），但长边超过 1280 的图会被平台按长边重新缩放并重新编码 —— 因此 `slice_max_height` / `image_max_width` 设得比 1280 更大不会生效；另外高度在 1280~1600 之间的长截图低于插件的切片阈值，会走平台的缩放（宽度损失约 2%~20%），而不是切片。
 - 长文本瓜条注入后会占用较多上下文，受模型上下文长度限制。开启长截图切片后图片张数增加，token 消耗更明显 —— 可用 `context_mode=once` 或调小 `max_images` 缓解。

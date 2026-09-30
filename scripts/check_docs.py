@@ -90,6 +90,7 @@ def run_test_count(root: pathlib.Path) -> int | None:
     静态数 `check(` 会把字符串/提示语里的同名文本也算进去，不准。
     实测：某次静态数 213，真实数 216 —— 差的就是 f-string 里的字面量。
     """
+    import os
     import subprocess
     import sys
 
@@ -103,6 +104,10 @@ def run_test_count(root: pathlib.Path) -> int | None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            # 必须显式指定子进程用 UTF-8 输出：Windows 中文控制台下子进程默认按
+            # GBK 往管道里写，父进程按 UTF-8 解码后中文变成 U+FFFD，下面那句
+            # `通过 (\d+) 项` 永远匹配不到 —— 检查会静默失效（只剩一句「测试跑不起来」）。
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             cwd=str(root),
             timeout=300,
         )

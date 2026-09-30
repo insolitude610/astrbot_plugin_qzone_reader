@@ -13,7 +13,7 @@ from html import unescape
 from http.cookies import SimpleCookie
 from time import monotonic
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 from astrbot.api import logger
@@ -65,23 +65,72 @@ class QzoneAuthError(RuntimeError):
     """登录态失效，调用方应当作废缓存的 Cookie 并重新获取。"""
 
 
-def _host_matches(url: Any, domains: tuple[str, ...]) -> bool:
-    """URL 的 hostname 是否落在给定域名（或其子域）内。
+def _url_parts(url: Any) -> SplitResult | None:
+    """解析 URL，失败时返回 None（把 urlsplit 的异常收在一处）。"""
+    try:
+        return urlsplit(str(url))
+    except (ValueError, TypeError):
+        return None
+
+
+def _host_is(url: Any, domains: tuple[str, ...]) -> bool:
+    """URL 的 hostname 是否落在给定域名（或其子域）内 —— 不看 scheme。
 
     刻意用解析后的 hostname，而不是对整条 URL 做子串判断 —— 后者会把
     `https://evil.example/?x=qzone.qq.com` 这种地址也放进来，而带着 Cookie
     的请求一旦发出去，账号登录态就泄露了。任何解析失败都按不匹配处理。
+
+    注意：门禁一律用下面的 `_host_matches`（额外要求 https）。这个函数只给
+    「先判主机、再决定要不要升级 scheme」的 `normalize_qzone_url` 用。
     """
-    try:
-        parts = urlsplit(str(url))
-    except (ValueError, TypeError):
-        return False
-    if parts.scheme != "https":
+    parts = _url_parts(url)
+    if parts is None:
         return False
     host = (parts.hostname or "").lower().rstrip(".")
     if not host:
         return False
     return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
+def _host_matches(url: Any, domains: tuple[str, ...]) -> bool:
+    """`_host_is` 的 https 版本：抓取与凭据门禁都只认 https。
+
+    明文 http 一律不匹配 —— 既不发 Cookie，也不采信页面内容。
+    """
+    parts = _url_parts(url)
+    return parts is not None and parts.scheme == "https" and _host_is(url, domains)
+
+
+def normalize_qzone_url(url: Any) -> str | None:
+    """把 QQ空间地址规范成「可抓取」的形式：http 升级为 https。
+
+    为什么需要：凭据门禁（`may_send_credentials`）只认 https，而 QQ空间分享页里
+    内嵌的跳转地址常常写成 `http://mobile.qzone.qq.com/l?...`。这种地址不升级就
+    带不上登录态，QQ 会把请求当匿名处理、302 到登录页（i.qq.com），于是说说正文
+    永远读不到 —— 纯文字说说（卡片 `bizsrc=qzone.shuoshuoshareonlytext`）正是
+    走这条路。
+
+    只做两件事：scheme 由 http 改成 https（同主机，TLS 证书校验照旧），以及拒绝
+    不该出现的形态。**主机集合不扩大** —— 这批主机本来就在 `CREDENTIAL_HOSTS`
+    内、本来就能收 https 凭据，所以不存在「凭据被发到新地方」的风险。
+
+    Returns:
+        规范化后的地址；非 QQ空间地址、非 http(s) 协议、或带 userinfo 时返回
+        None（fail-closed，调用方应当放弃该地址）。
+    """
+    parts = _url_parts(url)
+    if parts is None or parts.scheme not in ("http", "https"):
+        return None
+    if parts.username or parts.password:
+        # QQ空间地址从不需要 userinfo，带上它只可能是被构造出来的，
+        # 直接拒绝，而不是把 userinfo 原样带进后续请求。
+        return None
+    if not _host_is(url, TRUSTED_SHARE_HOSTS):
+        return None
+    if parts.scheme == "https":
+        # 已经是 https 就原样返回，不做无谓的重编码
+        return str(url)
+    return urlunsplit(("https", parts.netloc, parts.path, parts.query, parts.fragment))
 
 
 def is_trusted_qzone_url(url: Any) -> bool:
@@ -448,7 +497,8 @@ async def _fetch_from_share_page(
     url: str,
 ) -> QzonePost | None:
     """抓 h5 分享页并解析其中的说数据。"""
-    for candidate in _share_page_candidates(url):
+    candidates = _share_page_candidates(url)
+    for candidate in candidates:
         html = await _get_html(session, candidate, creds)
         if not html or "FrontPage" not in html:
             continue
@@ -457,7 +507,12 @@ async def _fetch_from_share_page(
             continue
         post = _post_from_cell(cell, url=candidate)
         if post is not None:
+            logger.info("[qzone_reader] 分享页命中: %s", candidate)
             return post
+    # 全部候选都不行时给一条明确的日志：排查时最想知道的就是「到底试了几个地址」
+    logger.info(
+        "[qzone_reader] 分享页未取到内容（已尝试 %d 个候选地址）", len(candidates)
+    )
     return None
 
 
@@ -684,11 +739,17 @@ async def _resolve_share(
     """跟随分享短链跳转，返回 (最终地址, 最终地址的参数)。
 
     失败或跳到非 QQ空间地址时原样返回入参，由调用方决定是否放弃。
+
+    注意：返回的地址一定经过 `normalize_qzone_url`，所以它可能与入参/跳转目标
+    **字面不同** —— 页面里内嵌的跳转地址可能是明文 http，必须升级成 https，
+    否则后续抓取不会带登录态（见 `normalize_qzone_url` 的注释）。
     """
     final, _status, _body = await fetch_trusted(session, url, creds=creds)
-    if not is_trusted_qzone_url(final):
+    normalized = normalize_qzone_url(final)
+    if normalized is None:
         logger.warning("[qzone_reader] 分享链接跳转到了非 QQ空间地址，忽略跳转: %s", final)
-        final = url
+        normalized = url
+    final = normalized
 
     params = parse_share_url(final)
     if _has_feed_locator(params):
@@ -700,9 +761,15 @@ async def _resolve_share(
     except Exception:  # noqa: BLE001
         return final, params
     for found in _URL_RE.findall(text or ""):
-        cand = parse_share_url(unescape(found))
+        # 页面里的地址同样是外部输入：只接受 QQ空间主机，并统一升级成 https。
+        # 早期实现直接 `return found`，于是页面里一个明文 http 的地址会被原样
+        # 拿去抓 —— 而 http 带不上凭据，QQ 会把它当匿名请求踢到登录页。
+        cand_url = normalize_qzone_url(unescape(found))
+        if cand_url is None:
+            continue
+        cand = parse_share_url(cand_url)
         if _has_feed_locator(cand):
-            return found, cand
+            return cand_url, cand
     return final, params
 
 

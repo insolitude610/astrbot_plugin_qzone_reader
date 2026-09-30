@@ -165,7 +165,9 @@ fetch_post(creds, share_url)
   ├─ is_trusted_qzone_url()            入口门禁：非白名单域名直接放弃
   │
   ├─ _resolve_share()                  逐跳跟随 302，拿最终地址与参数
-  │     └─ fetch_trusted()             每跳重新决定请求头（见「凭据边界」）
+  │     ├─ fetch_trusted()             每跳重新决定请求头（见「凭据边界」）
+  │     └─ normalize_qzone_url()       页面/跳转给的明文 http 升级为 https
+  │                                    （不升级就带不上登录态，见「关键设计决策」）
   │
   ├─ 首选：_fetch_from_share_page()    解析 h5 分享页
   │     ├─ _share_page_candidates()    候选地址（带/不带尾斜杠）
@@ -206,6 +208,13 @@ fetch_post(creds, share_url)
    aiohttp 跟随时会把原始请求头原样带到新地址（只去掉 Authorization），
    所以一次性设好的 Cookie 会跨主机泄露。逐跳跟随还顺带对齐了两个语义：
    首跳之后不再携带原始 query（避免 `uin`/`g_tk` 跟着跳转跑）、整条链共用一个总超时。
+4. **凭据只认 https：明文 http 不能「放行」，只能在解析层升级成 https。**
+   `_host_matches` 里的 `scheme == "https"` 是刻意保留的 —— 宁可这一次没有登录态，
+   也不能把 Cookie 发到明文连接上。所以遇到 QQ 自己给出的 `http://` 地址
+   （分享页内嵌的跳转地址就是 http），做法是用 `normalize_qzone_url` 把 scheme
+   改写成 https 再抓，而不是放松门禁。**主机集合不变**：`TRUSTED_SHARE_HOSTS`
+   里的主机本来就在 `CREDENTIAL_HOSTS` 内、本来就能收 https 凭据，升级不会让
+   凭据去新的地方。
 
 残余风险（已接受，改动时留意）：白名单**内部**主机之间互跳仍会带 Cookie，
 所以边界等价于「任何白名单域名被攻破或被开放重定向」；`Referer` / `Origin`
@@ -336,7 +345,10 @@ fetch_post(creds, share_url)
 | 函数 | 说明 |
 | --- | --- |
 | `extract_share_url(payload)` | 递归扫描任意 JSON/文本，找出 QQ空间分享地址。会先 `unescape`（QQ 卡片把逗号转义成 `&#44;`），再**按解析后的 hostname 过白名单** |
-| `is_trusted_qzone_url(url)` / `may_send_credentials(url)` | 两个凭据边界判定：能不能抓这个地址 / 能不能给它发 Cookie |
+| `is_trusted_qzone_url(url)` / `may_send_credentials(url)` | 两个凭据边界判定：能不能抓这个地址 / 能不能给它发 Cookie。**都只认 https** |
+| `normalize_qzone_url(url)` | 把 QQ空间地址规范化成可抓取形式：**http 升级为 https**。非 QQ空间地址、非 http(s) 协议、带 userinfo 一律返回 `None`。只改 scheme，不改主机 |
+| `_host_is(url, domains)` / `_host_matches(url, domains)` | hostname 白名单的前后端：前者只看主机，后者额外要求 https（门禁一律用后者） |
+| `_url_parts(url)` | `urlsplit` 的统一封装，解析失败返回 `None` |
 | `fetch_trusted(session, url, params, creds, …)` | 逐跳跟随跳转的 GET，返回 `(最终地址, 状态码, 响应体)`；每跳重新决定请求头 |
 | `extract_card_text(payload, limit=300)` | 取卡片标题/摘要作为降级文案 |
 | `parse_share_url(url)` | 解析 query。分隔符同时支持 `&` 和 `,` |
@@ -350,8 +362,8 @@ fetch_post(creds, share_url)
 | 函数 | 说明 |
 | --- | --- |
 | `fetch_post(creds, url, timeout=20)` | 总入口，分享页优先、列表接口兜底 |
-| `_resolve_share(session, creds, url)` | 跟随跳转拿最终地址；失败则从 HTML 里找 |
-| `_fetch_from_share_page(...)` | 抓分享页并解析 |
+| `_resolve_share(session, creds, url)` | 跟随跳转拿最终地址；失败则从 HTML 里找。**返回值一律过 `normalize_qzone_url`**，因此可能与跳转目标字面不同（只有 scheme 被改写） |
+| `_fetch_from_share_page(...)` | 抓分享页并解析；命中与全部失败各有一条日志 |
 | `_share_page_candidates(url)` | 生成候选地址 |
 | `_post_from_cell(cell, url)` | cell → `QzonePost`，处理转发两层 |
 | `_fetch_via_msglist(...)` | 列表接口路径 |
@@ -517,6 +529,48 @@ orglikekey : http://user.qzone.qq.com/<原作者uin>/mood/<原cellid>
 > 然后随手取第一条，把**完全无关的说说**注入给了用户。
 
 宁可如实返回 `None` 走降级，也不能猜。`_extract_host_uin` 同样：认不出就放弃，**绝不退回自己的 uin**。`test_core.py` 的 `[8c]` 段专门钉死这两点。
+
+### 为什么 http 的 QQ空间地址要升级成 https
+
+**这是 v1.0.2 修的线上问题**：用户分享一条**纯文字**说说，bot 只看到卡片摘要的开头，看不到正文。
+
+真实日志（`data/logs/astrbot.<日期>.log`）：
+
+```
+分享短链已解析为: http://mobile.qzone.qq.com/l?g=100&…&res_uin=…&cellid=…    ← 明文 http
+分享页跳转到了非 QQ空间地址，放弃: https://i.qq.com/?s_url=http://user.qzone.qq.com/…/mood/…
+分享页没取到内容，改走动态列表接口兜底
+接口返回 HTTP 500: …/emotion_cgi_msglist_v6
+```
+
+链条：
+
+1. 纯文字说说用的是**另一套卡片**（`bizsrc=qzone.shuoshuoshareonlytext`，`jumpUrl` 形如
+   `mobile.qzone.qq.com/l?g=1336&…ciphertext=…`），不是带图瓜条那种
+   `h5.qzone.qq.com/ugc/share` —— 所以它压根不走那条已经被验证过的路。
+2. 那个 `g=1336` 页面返回 **200 的 HTML**，里面把真正的 cell 地址写成**明文 http**：
+   `http://mobile.qzone.qq.com/l?g=100&…&res_uin=…&cellid=…`。
+3. `_resolve_share` 的「从 HTML 里找地址」分支**原样返回**了它 —— 那一行既没有 scheme
+   校验也没有主机校验（`is_trusted_qzone_url` 只守着前面那条 return 路径）。
+4. 抓这个 http 地址时，凭据门禁（要求 https）不成立 → 请求**不带 Cookie** → QQ 把它当
+   匿名请求，302 到登录页 `i.qq.com` → `_get_html` 拒绝解析非 QQ空间页面。
+5. 唯一的兜底 `emotion_cgi_msglist_v6` 返回 HTTP 500，整条路断掉，于是
+   `_build_payload` 降级到 `_card_text()` —— 而 QQ 卡片自带的 `desc` 本来就以 `...`
+   结尾（腾讯自己截的），所以 bot 只能看到开头那几十个字。
+
+修法是**升级 scheme**、而不是放松门禁：`normalize_qzone_url` 只把 QQ空间主机的 `http`
+改成 `https`（同主机、证书校验照旧、主机集合不变），让请求重新带上登录态。
+`_resolve_share` 的两条返回路径现在都必须过这个函数，于是页面里那些**非 QQ空间**的地址
+也顺带被挡住了 —— 以前页面里一个 `https://evil.example/?res_uin=1&cellid=2` 会被原样拿去
+抓（虽然没有 Cookie，但会白跑一次请求，还会把响应交给解析器）。
+`test_core.py` 的 `[22h]` 段把这三件事都钉住了：必须升级、必须拒绝非白名单主机、
+端到端那次 cell 请求必须走 https 且带 Cookie。
+
+**遗留未解**：升级之后落点页是否一定含 `FrontPage` 数据，离线无法验证；若仍读不到，
+新加的两条日志（分享页命中 / 分享页未取到内容）会给出下一步的证据。**不要靠猜地址**：
+曾评估过用 `res_uin` + `cellid` 拼 `user.qzone.qq.com/<uin>/mood/<cellid>` 作候选，
+已否决 —— `res_uin` 在 h5 分享链接里是 uid 不是 QQ 号，且 `_post_from_cell` 无法校验
+cell 身份，猜错就会把**无关说说**注入对话（正是上面那条 `msglist[0]` 教训的同类错误）。
 
 ### 为什么登录态要带 TTL 缓存
 
@@ -729,7 +783,7 @@ cd astrbot_plugin_qzone_reader
 python test_core.py
 ```
 
-当前 **304 项断言**。分段：
+当前 **325 项断言**。分段：
 
 | 段 | 覆盖 |
 | --- | --- |
@@ -753,6 +807,7 @@ python test_core.py
 | `[22e]` | **图片覆盖张数**：`covered` 与渲染文案一致，不再把切片块数说成原图张数 |
 | `[22f]` | 裸 `uin` 不再采信、分享页候选地址三种形态 |
 | `[22g]` | **待注入 token**：不串内容、无 token 不注入、过期回收 |
+| `[22h]` | **http → https 升级**：`normalize_qzone_url` 的升级/拒绝/幂等/端口/userinfo、门禁与凭据边界不变，以及三条回归（HTML 里的 http 地址被升级、非白名单地址不再被采信、`fetch_post` 端到端那次 cell 请求必须走 https 且带 Cookie），外加「不合成猜出来的候选地址」 |
 
 > **写测试桩时注意**：桩必须提供 `resp.status`（`fetch_bytes` 会读），
 > 并且返回体要是 `async with` 可用的上下文管理器（`fetch_trusted` 也这样用）。
@@ -778,13 +833,20 @@ python scripts/check_docs.py
 | --- | --- |
 | 1 | README 配置表的默认值是否与 `_conf_schema.json` 一致（带引号、大小写、`空` vs `[]` 等写法差异会归一化，不算不一致） |
 | 2 | schema 里每个键是否都被 `main.py` 真正读取（防「假开关」） |
-| 3 | `DEVELOPMENT.md` 声称的断言数与 `test_core.py` 里 `check()` 调用数是否相等 |
+| 3 | `DEVELOPMENT.md` 声称的断言数与 `test_core.py` **实际跑出来的通过数**是否相等（不是静态统计 `check(` 调用数 —— 字符串里的同名文本会被误算） |
 | 4 | 文档引用的日志串是否与代码实际输出对得上（`<占位符>` 当通配处理） |
 | 5 | 已删除的概念是否被**重新定义/使用**（历史注记里提到旧名不算残留） |
 | 5b | 提到已删除概念时是否明确标注了「已移除」，否则会误导读者 |
 | 6 | `metadata.yaml` 的 `repo` 地址是否出现在 README 里 |
 
 退出码非 0 即表示有漂移。
+
+**第 3 项曾经静默失效过**：脚本用 `subprocess` 跑 `test_core.py` 并抓 stdout，但没给子进程
+指定输出编码。Windows 中文控制台下子进程默认按 GBK 往管道里写，父进程按 UTF-8 解码后
+中文全变成 U+FFFD，正则 `通过 (\d+) 项` 永远匹配不到 —— 于是第 3 项只剩一句
+「测试跑不起来」，标记成「近似」后**直接通过**，文档数字再错也发现不了。
+现在给子进程显式传 `PYTHONIOENCODING=utf-8`，这一项才真的在比对。
+（踩过的表现是：本地刚跑出 325 项，检查器却说「测试跑不起来，静态统计约 285 处」。）
 
 **这个脚本本身就是被现实教育出来的**：写文档过程中多次出现「代码改了、文档还写着旧链路」，
 以及检查器自身的误报（把 `"napcat"` 这种正确写法判为不一致、把历史注记判为残留）。
@@ -823,7 +885,9 @@ grep qzone_reader /AstrBot/data/logs/astrbot.log
 | --- | --- |
 | `检测到 QQ空间分享，开始读取: <url>` | 链接识别成功 |
 | `使用 <source> 提供的 QQ空间登录态` | 登录态就位 |
-| `分享短链已解析为: <url>` | 302 解析成功 |
+| `分享短链已解析为: <url>` | 302 解析成功。**注意看这里的 scheme：应该是 https**，写成 http 就说明升级没生效 |
+| `分享页命中: <url>` | 分享页路径成功，值是命中的那个候选地址 |
+| `分享页未取到内容（已尝试 <N> 个候选地址）` | 所有候选地址都没解析出数据 |
 | `这是一条转发：原作者 X（QQ N），已连同原文一起读取` | 转发两层都拿到 |
 | `分享页没取到内容，改走动态列表接口兜底` | 分享页无数据 |
 | `在 uin=X 的动态里没找到该条说说（cellid=Y），放弃` | 列表接口也定位不到 |
@@ -895,6 +959,9 @@ print(cell.keys() if cell else "解析失败")
 | **白名单取不到会话 ID 时 fail-closed** | 老实现是「取不到就放行」，现在按「不在白名单」处理。真实 AstrBot 事件一定有 `unified_msg_origin`，只影响测试桩或极老版本 |
 | **跳转链共用一个总超时** | `fetch_trusted` 用 `total_timeout` 给整条链计时，不再每跳重新计时；跳数上限取 aiohttp 默认的 10 |
 | 分享页可能返回登录页 | 此时 `FrontPage` 仍在但 `data` 为空，会落到列表接口兜底 |
+| **升级 scheme 后落点页仍可能没有 `FrontPage`** | v1.0.2 只修掉了「匿名请求被 QQ 踢到登录页」这一环；带 Cookie 的 `https://mobile.qzone.qq.com/l?g=100…` 到底返回什么，离线无法验证。若仍读不到，看「分享页命中」/「分享页未取到内容」两条日志再按证据迭代，**不要猜地址** |
+| **`emotion_cgi_msglist_v6` 返回 HTTP 500** | 三级兜底（分享页失败后才会走到），生产日志里 500，原因未查明。`g_tk` 该用 `p_skey` 还是 `skey` 推导、Cookie 是否该带全（`p_uin`/`pt2gguin` 等）都只是怀疑，**没有证据前不要改** |
+| **`normalize_qzone_url` 只改 scheme，不猜地址** | 非 QQ空间主机、非 http(s) 协议、带 userinfo 一律返回 `None`。QQ 若改用别的跳转域名，要按日志补白名单，而不是在这里放开 |
 | 视频 | 只记录数量，未解析。`cell_video()` 已能取地址，但未接入注入 |
 | 切片参数为经验值 | `DEFAULT_SLICE_HEIGHT=1280`、`is_tall` 的 1.5 倍判据都基于常见视觉模型的缩放行为，未针对具体模型实测校准。不同模型的上限不同，必要时可用 `slice_max_height` 调整 |
 | 切片不计内容边界 | 按固定像素切，重叠 80px 只能降低切断风险，无法保证不切断一条消息 |

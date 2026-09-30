@@ -1612,6 +1612,191 @@ def main() -> int:
     p_ttl._sweep_pending()
     check("未过期条目不会被顺手清掉", len(p_ttl._pending) == 1)
 
+    print("\n[22h] 明文 http 的分享地址必须升级成 https（纯文字说说读不到正文的根因）")
+
+    # 真实事故形态：纯文字说说卡片 -> g=1336 分享页 -> 页面里内嵌的 cell 地址是明文 http。
+    # 不升级成 https 就带不上登录态，QQ 会把它当匿名请求 302 到登录页。
+    http_cell = (
+        "http://mobile.qzone.qq.com/l?g=100&g_f=2000000034"
+        "&res_uin=10001&appid=311&cellid=6b09cbbb2a51bd6a90e50100&source_g=84"
+    )
+    https_cell = http_cell.replace("http://", "https://", 1)
+
+    check(
+        "明文 http 的 QQ空间地址被升级为 https",
+        api.normalize_qzone_url(http_cell) == https_cell,
+        repr(api.normalize_qzone_url(http_cell)),
+    )
+    check(
+        "升级后 query（res_uin / cellid）不丢",
+        api.parse_share_url(api.normalize_qzone_url(http_cell) or "").get("cellid")
+        == "6b09cbbb2a51bd6a90e50100",
+        repr(api.normalize_qzone_url(http_cell)),
+    )
+    good_https = "https://h5.qzone.qq.com/ugc/share?res_uin=10001&cellid=abc"
+    check(
+        "已可信的 https 地址原样返回（幂等）",
+        api.normalize_qzone_url(good_https) == good_https,
+    )
+    check(
+        "非 http(s) 协议返回 None",
+        api.normalize_qzone_url("ftp://mobile.qzone.qq.com/l") is None,
+        repr(api.normalize_qzone_url("ftp://mobile.qzone.qq.com/l")),
+    )
+    check(
+        "非 QQ空间主机返回 None",
+        api.normalize_qzone_url("https://evil.example/x") is None
+        and api.normalize_qzone_url("http://evil.example/?qzone.qq.com") is None
+        and api.normalize_qzone_url("http://qzone.qq.com.evil.example/ugc/share") is None,
+    )
+    check(
+        "带 userinfo 的地址被拒（fail-closed）",
+        api.normalize_qzone_url("http://user:pw@mobile.qzone.qq.com/l?g=100") is None,
+        repr(api.normalize_qzone_url("http://user:pw@mobile.qzone.qq.com/l?g=100")),
+    )
+    check("畸形地址不抛异常", api.normalize_qzone_url("https://[bad") is None)
+    check(
+        "非默认端口保留（与 is_trusted_qzone_url 的端口无关性一致）",
+        api.normalize_qzone_url("http://mobile.qzone.qq.com:8443/l?g=100")
+        == "https://mobile.qzone.qq.com:8443/l?g=100",
+        repr(api.normalize_qzone_url("http://mobile.qzone.qq.com:8443/l?g=100")),
+    )
+
+    # 安全边界必须原样：门禁仍只认 https，凭据绝不发往明文 http
+    check("门禁仍拒绝明文 http", api.is_trusted_qzone_url(http_cell) is False)
+    check("凭据仍不发往明文 http", api.may_send_credentials(http_cell) is False)
+    check(
+        "升级成 https 之后凭据才可发送（证明「升级」就是修复点）",
+        api.may_send_credentials(https_cell) is True,
+    )
+
+    # 路由桩：按 URL 前缀返回响应体，并记录每次请求的 (url, headers)
+    class RouteResp:
+        def __init__(self, body: bytes, url: str, status=200):
+            self._body = body
+            self.url = url
+            self.status = status
+            self.headers = {}
+
+        async def read(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class RouteSession:
+        def __init__(self, routes, log):
+            self._routes = routes
+            self._log = log
+
+        def get(self, url, params=None, headers=None, **kw):
+            self._log.append((url, dict(headers or {})))
+            for prefix, status, body in self._routes:
+                if url.startswith(prefix):
+                    return RouteResp(body, url, status)
+            return RouteResp(b"", url, 404)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    # 入参 URL 本身**不含** res_uin / cellid —— 否则 _resolve_share 会在
+    # 「已能定位」处提前 return，HTML 扫描分支根本不会被走到，测试就失去证伪力。
+    entry = (
+        "https://mobile.qzone.qq.com/l?g=1336&appid=311&subtype=0&blog_photo=0"
+        "&ciphertext=DEADBEEF&uw=10001&jumptoqzone=1&loginfrom=4"
+    )
+    entry_prefix = "https://mobile.qzone.qq.com/l?g=1336"
+    check("测试入参本身不含定位参数（保证走的是扫描分支）", api._has_feed_locator(api.parse_share_url(entry)) is False)
+
+    entry_html = f"<html><script>location.href='{http_cell}';</script></html>".encode()
+    creds_t = api.QzoneCredentials(uin=10001, skey="SK", p_skey="PK")
+
+    resolved_url, resolved_params = asyncio.run(
+        api._resolve_share(
+            RouteSession([(entry_prefix, 200, entry_html)], []), creds_t, entry
+        )
+    )
+    check(
+        "回归 A：页面里的明文 http cell 地址被升级为 https",
+        resolved_url == https_cell,
+        repr(resolved_url),
+    )
+    check(
+        "回归 A：升级后的地址仍带定位参数",
+        resolved_params.get("cellid") == "6b09cbbb2a51bd6a90e50100",
+        str(resolved_params),
+    )
+
+    evil_html = b"<html>https://evil.example/x?res_uin=10001&cellid=zzz</html>"
+    resolved_evil, _p_evil = asyncio.run(
+        api._resolve_share(
+            RouteSession([(entry_prefix, 200, evil_html)], []), creds_t, entry
+        )
+    )
+    check(
+        "回归 B：页面里的非 QQ空间地址不再被采信",
+        resolved_evil == entry,
+        repr(resolved_evil),
+    )
+
+    # 回归 C：端到端。两层 FrontPage（data.data 才是 cell）—— 与真实分享页同构。
+    cell = {
+        "cell_comm": {"time": 1700000000, "appid": 311},
+        "cell_userinfo": {"user": {"uin": 10001, "nickname": "小明"}},
+        "cell_summary": {"summary": "这是全文正文，卡片 desc 里只有开头"},
+    }
+    fp_html = (
+        "<html><script>var FrontPage = {\n"
+        " loginUin : 'NaN',\n"
+        f" data : {json.dumps({'data': cell}, ensure_ascii=False)}\n"
+        "};</script></html>"
+    ).encode()
+    check("两层 FrontPage 能被解析出 cell", api.frontpage.extract_share_post(fp_html.decode("utf-8")) is not None)
+
+    log: list = []
+    routes = [
+        (entry_prefix, 200, entry_html),
+        ("https://mobile.qzone.qq.com/l?g=100", 200, fp_html),
+    ]
+    saved_session = api.aiohttp.ClientSession
+    api.aiohttp.ClientSession = lambda **kw: RouteSession(routes, log)
+    try:
+        post_c = asyncio.run(api.fetch_post(creds_t, entry))
+    finally:
+        api.aiohttp.ClientSession = saved_session
+
+    cell_calls = [(u, h) for u, h in log if "g=100" in u]
+    check("回归 C：确实去抓了 cell 地址", len(cell_calls) == 1, str(log))
+    check(
+        "回归 C：cell 地址走 https（明文 http 会丢掉登录态）",
+        bool(cell_calls) and cell_calls[0][0].startswith("https://"),
+        str(cell_calls),
+    )
+    check(
+        "回归 C：cell 请求带上了登录态 Cookie",
+        bool(cell_calls) and "Cookie" in cell_calls[0][1],
+        str(cell_calls),
+    )
+    check(
+        "回归 C：读到完整正文，而不是退回截断的卡片文案",
+        post_c is not None and post_c.text == "这是全文正文，卡片 desc 里只有开头",
+        repr(post_c.text if post_c else None),
+    )
+
+    cand_cell = api._share_page_candidates(https_cell)
+    check(
+        "不合成「猜出来」的地址（曾评估过的 mood 页猜法不入代码）",
+        all("mood/" not in item for item in cand_cell)
+        and all("user.qzone.qq.com" not in item for item in cand_cell),
+        str(cand_cell),
+    )
+
     print("\n" + "=" * 56)
     print(f"通过 {passed} 项，失败 {len(failed)} 项")
     if failed:
