@@ -5,6 +5,50 @@
 
 升级方式：在 AstrBot WebUI 的插件页更新 / 重载插件即可。
 
+## [1.0.2] - 2026-10-01
+
+### 修复
+
+- **纯文字说说读不到正文（只看到开头几十个字）。** 这类分享用的是**另一套链接**：卡片
+  `bizsrc=qzone.shuoshuoshareonlytext`、`jumpUrl` 形如
+  `mobile.qzone.qq.com/l?g=1336&…ciphertext=…`（不是带图瓜条那种 `h5.qzone.qq.com/ugc/share`）。
+  那个 `g=1336` 页面返回 200 HTML，把真正的说说地址写成了**明文 http**：
+  `http://mobile.qzone.qq.com/l?g=100&…&res_uin=…&cellid=…`；而 `_resolve_share` 的
+  「从 HTML 里找地址」分支**既没有 scheme 校验、也没有主机校验**，于是把这个 http 地址
+  原样当成最终地址返回。
+  接下来抓它时，凭据门禁（只认 https）不成立 → 请求**不带 Cookie** → QQ 当匿名处理，
+  302 到登录页 `i.qq.com` → 分享页解析失败；唯一的兜底接口 `emotion_cgi_msglist_v6`
+  又返回 HTTP 500。整条路断掉后，插件降级成卡片文字，而 **QQ 卡片自带的 `desc` 摘要
+  本身就是被腾讯截断的**（以 `...` 结尾）—— 所以 bot 只能看到正文开头。
+  现在 `_resolve_share` 的两条返回路径都必须过 `normalize_qzone_url`：QQ空间主机的
+  `http` 会升级成 `https`，请求重新带上登录态。
+
+### 安全
+
+- 顺手堵上一个缺口：以前分享页 HTML 里出现的**任意主机**地址，只要带着
+  `res_uin`/`cellid` 就会被原样拿去抓（虽然不带 Cookie，但会白跑一次请求，还会把响应
+  交给解析器）。现在只接受白名单主机。
+- **边界没有放宽**：`is_trusted_qzone_url` / `may_send_credentials` 仍然只认 https，
+  卡片里的明文 http 分享链接照旧拒绝。升级只改 scheme、不改主机 —— 白名单主机本来
+  就能收 https 凭据，所以凭据可能去的地方一个也没增加。
+- `normalize_qzone_url` 对带 userinfo 的地址、非 http(s) 协议一律返回 `None`（fail-closed）。
+
+### 文档
+
+- `DEVELOPMENT.md` 新增「为什么 http 的 QQ空间地址要升级成 https」，附本次线上日志与
+  排除过程；补两条排查日志；并记录一条遗留风险：升级之后落点页是否一定含 `FrontPage`
+  仍需实测（新日志会给出证据，**不要靠猜地址**）。
+- README 补充纯文字说说的链接形态，以及「卡片摘要本来就被 QQ 截断」这一点。
+- 修掉 `scripts/check_docs.py` 第 3 项**静默失效**：它用子进程跑自测但没指定输出编码，
+  Windows 中文控制台下解码失败，断言数校验一直只打印一句「测试跑不起来」就放过。
+  现在给子进程传 `PYTHONIOENCODING=utf-8`，这一项才真的在比对。
+
+### 测试
+
+- 自测从 304 项增至 325 项，新增 `[22h]` 段：升级 / 拒绝 / 幂等 / 端口 / userinfo 等边界，
+  以及三条回归 —— HTML 里的明文 http 地址必须被升级、非白名单地址不再被采信、
+  `fetch_post` 端到端那次 cell 请求必须走 https 且带 Cookie（这三条在改动前是红的）。
+
 ## [1.0.1] - 2026-09-22
 
 ### 安全
