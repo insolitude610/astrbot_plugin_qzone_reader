@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.gif" width="150" alt="astrbot_plugin_qzone_reader">
+<img src="https://raw.githubusercontent.com/insolitude610/astrbot_plugin_qzone_reader/main/assets/logo.gif" width="150" alt="astrbot_plugin_qzone_reader">
 
 # astrbot_plugin_qzone_reader
 
