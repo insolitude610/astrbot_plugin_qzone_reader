@@ -40,6 +40,9 @@ TRUSTED_SHARE_HOSTS = ("qzone.qq.com", "qzonestyle.gtimg.cn")
 # 不带上它们，配图会因为缺少登录态而下载失败。
 CREDENTIAL_HOSTS = ("qzone.qq.com", "qpic.cn", "qlogo.cn", "gtimg.cn", "photo.store.qq.com")
 
+# 说说分享页的路径前缀（`is_share_page` 用它区分「页面本身就是数据源」与「只会跳转的中间页」）
+_SHARE_PATH = "/ugc/share"
+
 # 跟随跳转的跳数上限，与 aiohttp 的默认值保持一致
 MAX_REDIRECT_HOPS = 10
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -141,6 +144,36 @@ def is_trusted_qzone_url(url: Any) -> bool:
 def may_send_credentials(url: Any) -> bool:
     """该地址是否可以携带登录态 Cookie（决定凭据能发到哪里）。"""
     return _host_matches(url, CREDENTIAL_HOSTS)
+
+
+def is_share_page(url: Any) -> bool:
+    """是否是「说说分享页」（决定能不能把它当成解析目标直接用）。
+
+    分享页是 `h5.qzone.qq.com/ugc/share` 那一类地址，页面里直接内嵌了
+    `FrontPage` 数据（正文、配图、作者都在里面），**它自己就是数据源** ——
+    不像 `mobile.qzone.qq.com/l?g=100&…res_uin=…&cellid=…` 那种只负责跳转的
+    中间页，必须再跟一跳才能到内容。
+
+    为什么需要单独判定：`_has_feed_locator` 认的是 `res_uin`/`cellid` 这类
+    「定位参数」，而分享页的定位信息在路径里（`/ugc/share/<ciphertext>`），
+    于是分享页会被判成「没有定位信息」，进而被 `_resolve_share` 的扫描分支
+    覆盖掉（v1.0.3 修的线上问题，详见 DEVELOPMENT.md）。
+
+    判定只读解析后的 `path`，绝不匹配 query —— 否则一个查询串里带
+    `/ugc/share` 字样的跳转页会被误判成分享页。路径段也要卡边界：
+    `/ugc/share` 后面只允许是 `/`、`?`、`#` 或结束，避免
+    `/proxy/domain/ugc/sharexxx` 这种前缀被当成分享页而把扫描分支整个跳过。
+    主机仍走 `TRUSTED_SHARE_HOSTS` 的门禁口径（解析后的 hostname，防子串欺骗）。
+    """
+    parts = _url_parts(url)
+    if parts is None:
+        return False
+    if not _host_matches(url, TRUSTED_SHARE_HOSTS):
+        return False
+    path = parts.path or ""
+    if not path.startswith(_SHARE_PATH):
+        return False
+    return path[len(_SHARE_PATH) :][:1] in ("", "/", "?", "#")
 
 
 @dataclass
@@ -752,13 +785,31 @@ async def _resolve_share(
     final = normalized
 
     params = parse_share_url(final)
+    if is_share_page(final):
+        # 跳转终点本身就是分享页 —— 内容就在它的 FrontPage 里，直接用它。
+        # 绝不能继续往下走扫描分支：分享页的定位信息在路径里（没有 res_uin /
+        # cellid），扫描分支会去页面里挑一个「带定位参数」的地址（典型就是
+        # `mobile.qzone.qq.com/l?g=100&…&cellid=…`），那条路必然 302 到登录页
+        # i.qq.com —— v1.0.3 修的正是这一步。
+        logger.info(
+            "[qzone_reader] 跳转终点是分享页，直接采用: %s（原因：final-is-share-page）",
+            final,
+        )
+        return final, params
+
     if _has_feed_locator(params):
+        logger.info(
+            "[qzone_reader] 跳转终点带定位参数，直接采用: %s（原因：feed-locator）", final
+        )
         return final, params
 
     # 有的短链不靠跳转，而是把真实地址放在 HTML 里
     try:
         text = await _get_text(session, url, creds, {})
     except Exception:  # noqa: BLE001
+        logger.info(
+            "[qzone_reader] 读取分享链接失败，退回入口地址: %s（原因：entry-fallback）", final
+        )
         return final, params
     for found in _URL_RE.findall(text or ""):
         # 页面里的地址同样是外部输入：只接受 QQ空间主机，并统一升级成 https。
@@ -769,7 +820,15 @@ async def _resolve_share(
             continue
         cand = parse_share_url(cand_url)
         if _has_feed_locator(cand):
+            logger.info(
+                "[qzone_reader] 从分享页 HTML 里取到定位地址: %s（原因：page-scan）",
+                cand_url,
+            )
             return cand_url, cand
+    logger.info(
+        "[qzone_reader] 页面里没有可用的定位地址，退回入口地址: %s（原因：entry-fallback）",
+        final,
+    )
     return final, params
 
 

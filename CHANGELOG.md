@@ -5,6 +5,53 @@
 
 升级方式：在 AstrBot WebUI 的插件页更新 / 重载插件即可。
 
+## [1.0.3] - 2026-10-15
+
+### 修复
+
+- **转发带图说说时 bot 只看到截断的摘要、一张图都没有。** 这次不是图片处理坏了，而是**根本没走到取图那一步**。
+  `g=1336` 分享短链其实是 **302 直接跳到 h5 分享页**（`h5.qzone.qq.com/ugc/share/<ciphertext>?…`），
+  `fetch_trusted` 返回的 `final` **就是**这个分享页，正文、配图、作者都在它的 `FrontPage` 里；
+  但分享页的定位信息在**路径**里，`_has_feed_locator` 认的是 `res_uin`/`cellid`，于是这个判断为假，
+  `_resolve_share` 没有早返回，继续走「从页面 HTML 里找地址」的兜底分支 ——
+  而分享页里 `cell_operation` 的 `weixin_url` 恰好是
+  `http://mobile.qzone.qq.com/l?g=100&…&res_uin=…&cellid=…`，**带定位参数**，扫描分支命中就把它当成目标，
+  覆盖掉了手里那个已经下载好、内容完整的地址。
+  那条 `g=100` 的路（匿名与带凭据都一样）会一路 302：`g=84` → `user.qzone.qq.com/<uin>/mood/<cellid>` →
+  `i.qq.com` 登录页，`_get_html` 拒绝非 QQ空间页面 → 唯一候选失败；msglist 兜底又是 HTTP 500；
+  最后降级成卡片文字，而 QQ 卡片自带的 `desc` 是腾讯截断过的、**不含图片** ——
+  于是 bot 只能看到「截断的摘要 + 没有图片」。
+  现在 `_resolve_share` 在 `final` 本身就是分享页时**直接采用它**（`is_share_page()` 判定：解析后的 host 落在
+  QQ空间白名单内、且路径以 `/ugc/share` 起段 —— 只读 path、不匹配 query，并卡住路径段边界）。
+
+  补充一条实测结论（也是为什么这一步不能出错）：分享页**不需要登录态**（不带 Cookie、只带 `uin`、
+  带一整套假 `skey`/`p_skey` 三种形态响应一致），但它**需要完整地址** —— `ciphertext` / `uw`
+  写在跳转目标的查询串里，把查询串丢掉就只剩一个没有 `FrontPage` 的空壳。
+
+### 变更
+
+- `_resolve_share` 新增一条 info 日志，写明**采用地址的原因**：
+  `final-is-share-page` / `feed-locator` / `page-scan` / `entry-fallback`。
+  一次真机转发就能从日志判断走的是哪条路，也是后续排障的第一手证据。
+
+### 未做（有意为之）
+
+- **没有**改用 `res_uin` + `cellid` 拼 `user.qzone.qq.com/<uin>/mood/<cellid>` 去猜地址：与既有的
+  「`msglist[0]` 兜底」是同类错误，猜错会把**无关的说说**注入对话。
+- **没有**改凭据策略（例如「分享页不发 Cookie」）：实测匿名与三种假凭据形态都返回 200 + `FrontPage`，
+  凭据不是本次失败的原因；`QzoneCredentials.headers` 是全局策略（图片下载也走它），属于另一件事，
+  等真机日志有证据再说。
+
+### 测试
+
+- 自测从 325 项增至 354 项，新增 `[22i]` 段：`is_share_page` 的 path 口径（含路径段边界 `/ugc/sharexxx`、
+  非默认端口、fragment、以及 query 里的 `%2F` 不得误判）/ 主机门禁 / 畸形输入，以及四条端到端回归 ——
+  短链 302 → 分享页 200、分享页 HTML 里确实内嵌那条 `g=100` 死地址、不被它覆盖、
+  读到**完整正文**而非卡片截断文案、四张配图全读到、图片真的进 `req.image_urls`。
+  去掉本次那一行判断，该段会红 10 条断言（已用「保留 HEAD 版本实现、只替换 `_resolve_share`」的方式复验）。
+- ruff 仍是 9 项、与改动前逐条一致（`F401` / `I001` / `Q003` / `UP012`，全在既有行上，
+  本次新增代码零告警）。
+
 ## [1.0.2] - 2026-10-01
 
 ### 修复

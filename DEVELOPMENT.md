@@ -575,6 +575,62 @@ orglikekey : http://user.qzone.qq.com/<原作者uin>/mood/<原cellid>
 已否决 —— `res_uin` 在 h5 分享链接里是 uid 不是 QQ 号，且 `_post_from_cell` 无法校验
 cell 身份，猜错就会把**无关说说**注入对话（正是上面那条 `msglist[0]` 教训的同类错误）。
 
+### 为什么「跳转终点是分享页」时必须直接采用
+
+**这是 v1.0.3 修的线上问题**：用户转发一条**带图**的说说，bot 只看到卡片摘要的结尾，图片一张都没有。
+
+真实日志（`data/logs/astrbot.log`，2026-10-15 16:32）：
+
+```
+检测到 QQ空间分享，开始读取: https://mobile.qzone.qq.com/l?g=1336&…ciphertext=9AC3348D…
+使用 napcat 提供的 QQ空间登录态
+分享短链已解析为: https://mobile.qzone.qq.com/l?g=100&g_f=2000000034&res_uin=3150645611&appid=311&cellid=6b09cbbb7d94cf6a3e260700&source_g=84
+分享页跳转到了非 QQ空间地址，放弃: https://i.qq.com/?s_url=http://user.qzone.qq.com/3150645611/mood/6b09cbbb7d94cf6a3e260700
+分享页未取到内容（已尝试 1 个候选地址）
+分享页没取到内容，改走动态列表接口兜底
+接口返回 HTTP 500: …/emotion_cgi_msglist_v6
+```
+
+链条（**注意第一跳就已经到终点了**）：
+
+1. `g=1336` 短链 **302 到 h5 分享页** `https://h5.qzone.qq.com/ugc/share/<ciphertext>?…`，
+   所以 `fetch_trusted` 返回的 `final` **就是分享页本身**（实测 200、含 `FrontPage`）。
+2. 但分享页的定位信息在**路径**里（`/ugc/share/<ciphertext>`），
+   `_has_feed_locator` 认的是 `res_uin`/`cellid` —— 于是这一个判断为假，
+   `_resolve_share` 没有早返回，继续走「从页面 HTML 里找地址」的兜底分支。
+3. 分享页里那句 `weixin_url`（`cell_operation` 内）恰好是
+   `http://mobile.qzone.qq.com/l?g=100&…&res_uin=…&cellid=…`，**带定位参数**，
+   扫描分支命中就返回了它 —— 把手里那个**已经下载好、内容完整的**地址覆盖掉了。
+4. 抓那条 `g=100` 时（匿名与带凭据都一样）会一路 302：
+   `g=84` → `user.qzone.qq.com/<uin>/mood/<cellid>` → `i.qq.com` 登录页，
+   `_get_html` 拒绝非 QQ空间页面 → 唯一候选失败。
+5. 兜底的 `emotion_cgi_msglist_v6` 返回 HTTP 500，整条路断掉，于是降级到卡片文字；
+   QQ 卡片自带的 `desc` 本来就被腾讯截断，而且**不含图片** ——
+   bot 于是只能看到「截断的摘要 + 没有图片」。
+
+修法只有一行语义：**`final` 本身就是分享页时直接采用它**
+（`is_share_page(final) or _has_feed_locator(params)`）。
+
+为什么是「分享页优先」而不是别的：
+
+- 分享页是**唯一**内嵌 `FrontPage`（正文 + 配图 + 作者）的页面。它能读到的前提是
+  **地址完整**：`ciphertext` / `uw` 这些参数就写在跳转目标（`Location`）的查询串里，
+  `fetch_trusted` 会原样保留。实测**把查询串去掉只剩路径**时页面就没有 `FrontPage` 了
+  （返回 54KB 的壳，正文/配图全空）——所以「地址被扫描分支换掉」这件事的代价特别大。
+  另外它**不需要登录态**：不带 Cookie、只带 `uin`、带一整套假 `skey`/`p_skey`
+  三种形态的响应完全一致（91~95KB，均含 `FrontPage`）。
+- `g=100` 那条路对**任何**凭据形态都是死路（匿名与假凭据都落到 `i.qq.com`），
+  不是「登录态失效」的问题。
+- **没有**采用「用 `res_uin` + `cellid` 拼 `user.qzone.qq.com/<uin>/mood/<cellid>`」的猜法：
+  与既有的「`msglist[0]` 兜底」是同类错误（`[8c]`/`[22i]` 都钉着这条）。
+- **没有**动凭据策略（例如「分享页不发 Cookie」）：证据显示凭据不是本轮失败的原因，
+  改 `QzoneCredentials.headers` 会波及图片下载等所有调用方，属于另一件事。
+  若真机日志出现「分享页未取到内容」，再按「已知脆弱点」里记的两个备选方案单独迭代。
+
+`test_core.py` 的 `[22i]` 段把这条链完整复刻成离线回归（短链 302 → 分享页 200，
+且分享页 HTML 里确实内嵌着那条 `g=100` 地址）：去掉这个判断，该段会红 **10 条**断言，
+其中就包括「读到的是完整正文」与「图片真的进了 `req.image_urls`」。
+
 ### 为什么登录态要带 TTL 缓存
 
 `get_cookies` 是 OAuth 调用，每次消息都问一遍协议端没有必要。默认缓存 600 秒。失效时从两条路发现：接口返回 `AUTH_ERROR_CODES`（抛 `QzoneAuthError`），或请求异常。两种情况都会清缓存重取一次。
@@ -786,7 +842,7 @@ cd astrbot_plugin_qzone_reader
 python test_core.py
 ```
 
-当前 **325 项断言**。分段：
+当前 **354 项断言**。分段：
 
 | 段 | 覆盖 |
 | --- | --- |
@@ -811,6 +867,7 @@ python test_core.py
 | `[22f]` | 裸 `uin` 不再采信、分享页候选地址三种形态 |
 | `[22g]` | **待注入 token**：不串内容、无 token 不注入、过期回收 |
 | `[22h]` | **http → https 升级**：`normalize_qzone_url` 的升级/拒绝/幂等/端口/userinfo、门禁与凭据边界不变，以及三条回归（HTML 里的 http 地址被升级、非白名单地址不再被采信、`fetch_post` 端到端那次 cell 请求必须走 https 且带 Cookie），外加「不合成猜出来的候选地址」 |
+| `[22i]` | **跳转终点是分享页时必须直接采用**（v1.0.3 修的线上问题）：`is_share_page` 的 path 口径（含路径段边界 `/ugc/sharexxx`、端口、fragment、以及 query 里的 `%2F` 不得误判）/ 主机门禁 / 畸形输入，以及四条端到端回归（终点是分享页时不被页面里的 `g=100` 覆盖、读到完整正文而非卡片截断文案、四张配图全读到、图片真的进 `req.image_urls`），外加「退回入口地址时不猜 mood 页」 |
 
 > **写测试桩时注意**：桩必须提供 `resp.status`（`fetch_bytes` 会读），
 > 并且返回体要是 `async with` 可用的上下文管理器（`fetch_trusted` 也这样用）。
@@ -962,7 +1019,8 @@ print(cell.keys() if cell else "解析失败")
 | **白名单取不到会话 ID 时 fail-closed** | 老实现是「取不到就放行」，现在按「不在白名单」处理。真实 AstrBot 事件一定有 `unified_msg_origin`，只影响测试桩或极老版本 |
 | **跳转链共用一个总超时** | `fetch_trusted` 用 `total_timeout` 给整条链计时，不再每跳重新计时；跳数上限取 aiohttp 默认的 10 |
 | 分享页可能返回登录页 | 此时 `FrontPage` 仍在但 `data` 为空，会落到列表接口兜底 |
-| **升级 scheme 后落点页仍可能没有 `FrontPage`** | v1.0.2 只修掉了「匿名请求被 QQ 踢到登录页」这一环；带 Cookie 的 `https://mobile.qzone.qq.com/l?g=100…` 到底返回什么，离线无法验证。若仍读不到，看「分享页命中」/「分享页未取到内容」两条日志再按证据迭代，**不要猜地址** |
+| **升级 scheme 后落点页仍可能没有 `FrontPage`** | v1.0.2 只修掉了「匿名请求被 QQ 踢到登录页」这一环。v1.0.3 进一步确认：`g=1336` 短链的**终点就是** h5 分享页（含 `FrontPage`），原来的问题是它被扫描分支覆盖成了 `g=100` 死路。现在的日志会打印采用地址的原因（`final-is-share-page` / `feed-locator` / `page-scan` / `entry-fallback`），若用户环境里出现 `page-scan` 或「分享页未取到内容」，按日志迭代，**不要猜地址** |
+| **真机凭据下分享页的响应未验证** | 本机无法用用户的真实 NapCat 凭据验证。实测匿名与三种假凭据形态都是 200 + `FrontPage`，且修复后分享页是首选候选。若真机日志出现「分享页未取到内容」，按证据二选一（**都不要再猜**）：① 对分享页停发凭据（`headers()` 加 `and not is_share_page(url)`）——代价是「用户直接粘贴 h5 链接」且说说非公开时会失去唯一带凭据的候选，而 msglist 兜底在该环境实测 500；② 带凭据抓取后若页面不含 `FrontPage`，同一地址再匿名抓一次——代价是多一个失败分支与一次请求 |
 | **`emotion_cgi_msglist_v6` 返回 HTTP 500** | 三级兜底（分享页失败后才会走到），生产日志里 500，原因未查明。`g_tk` 该用 `p_skey` 还是 `skey` 推导、Cookie 是否该带全（`p_uin`/`pt2gguin` 等）都只是怀疑，**没有证据前不要改** |
 | **`normalize_qzone_url` 只改 scheme，不猜地址** | 非 QQ空间主机、非 http(s) 协议、带 userinfo 一律返回 `None`。QQ 若改用别的跳转域名，要按日志补白名单，而不是在这里放开 |
 | 视频 | 只记录数量，未解析。`cell_video()` 已能取地址，但未接入注入 |

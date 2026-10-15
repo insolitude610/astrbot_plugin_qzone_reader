@@ -1797,6 +1797,284 @@ def main() -> int:
         str(cand_cell),
     )
 
+    print("\n[22i] 跳转终点是分享页时必须直接采用（v1.0.3 修的线上问题）")
+
+    # ---- 复刻 2026-10-15 的真实事故（日志 astrbot.log:24029-24035）----
+    # 卡片里的短链 302 到 h5 分享页，**分享页就是跳转终点**，FrontPage 数据都在它里面。
+    # 但分享页的定位信息在路径里（/ugc/share/<ciphertext>），拿不到 res_uin / cellid，
+    # 于是旧的 _resolve_share 认为「没有定位信息」，转而扫描页面 HTML，
+    # 挑中页面里那条 cell_operation.weixin_url（带 res_uin / cellid 的 g=100 地址）——
+    # 那条路必然 302 到登录页 i.qq.com，读不到任何内容，最后降级成卡片自带文字，
+    # 也就是用户看到的「截断的摘要 + 没有图片」。
+    real_mobile_cell = (
+        "http://mobile.qzone.qq.com/l?g=100&g_f=2000000034&res_uin=10001&appid=311"
+        "&cellid=6b09cbbb7d94cf6a3e260700&source_g=84"
+    )
+    entry_url = (
+        "https://mobile.qzone.qq.com/l?g=1336&appid=311&subtype=0&blog_photo=0"
+        "&ciphertext=9AC3348D83FFD821D737546042630ED5&uw=10001&jumptoqzone=1&loginfrom=4"
+    )
+    share_path_page = (
+        "https://h5.qzone.qq.com/ugc/share/9AC3348D83FFD821D737546042630ED5"
+        "?uw=10001&subtype=0&sid=&loginfrom=4&jumptoqzone=1&blog_photo=0"
+        "&appid=311&ciphertext=9AC3348D83FFD821D737546042630ED5&g_f=&_wv=1"
+    )
+    share_query_page = "https://h5.qzone.qq.com/ugc/share?res_uin=10001&cellid=abc123"
+
+    check("分享页（路径形态）被认出", api.is_share_page(share_path_page) is True)
+    check("分享页（query 形态）被认出", api.is_share_page(share_query_page) is True)
+    check(
+        "普通分享页/带尾斜杠形态被认出",
+        api.is_share_page("https://h5.qzone.qq.com/ugc/share?") is True,
+    )
+    check(
+        "只负责跳转的 mobile cell 页不算分享页",
+        api.is_share_page(real_mobile_cell) is False,
+    )
+    check("非 QQ空间主机不算分享页", api.is_share_page("https://evil.example/ugc/share") is False)
+    check(
+        "query 里出现 /ugc/share 不误判（只认 path）",
+        api.is_share_page("https://mobile.qzone.qq.com/l?g=100&u=%2Fugc%2Fshare") is False,
+    )
+    check(
+        "路径段边界：/ugc/sharexxx 不算分享页",
+        api.is_share_page("https://mobile.qzone.qq.com/ugc/sharexxx?g=100") is False,
+    )
+    check(
+        "路径段边界：前缀里有 /ugc/share 但不在段首不算",
+        api.is_share_page("https://mobile.qzone.qq.com/proxy/ugc/share?g=100") is False,
+    )
+    check(
+        "带非默认端口的分享页仍被认出",
+        api.is_share_page("https://h5.qzone.qq.com:443/ugc/share?res_uin=1") is True,
+    )
+    check(
+        "带 fragment 的分享页仍被认出",
+        api.is_share_page("https://h5.qzone.qq.com/ugc/share#frag") is True,
+    )
+    check("明文 http 的分享页不算（门禁口径不变）", api.is_share_page("http://h5.qzone.qq.com/ugc/share") is False)
+    check("畸形地址不抛异常", api.is_share_page("https://[bad") is False)
+
+    incident_cell = {
+        "cell_comm": {"time": 1791988861, "appid": 311},
+        "cell_userinfo": {"user": {"uin": 10001, "nickname": "solitude"}},
+        "cell_summary": {"summary": "这是说说全文正文，卡片 desc 里只有开头那几十个字"},
+        "cell_pic": {
+            "picdata": [
+                {
+                    "photourl": {
+                        "0": {
+                            "url": f"https://r.photo.store.qq.com/psc?/V131sLJi1VpSRD/pic{i}/o&ek=1",
+                            "width": 1600,
+                            "height": 2133,
+                        }
+                    }
+                }
+                for i in range(4)
+            ]
+        },
+        "cell_operation": {"weixin_url": real_mobile_cell},
+    }
+    incident_html = (
+        "<html><script>var FrontPage = {\n"
+        " loginUin : 'NaN',\n"
+        f" data : {json.dumps({'data': incident_cell}, ensure_ascii=False)}\n"
+        "};</script></html>"
+    )
+
+    class IncidentResp:
+        def __init__(self, status, body: bytes, location: str | None = None):
+            self.status = status
+            self._body = body
+            self.headers = {"Location": location} if location else {}
+            self.url = ""
+
+        async def read(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class IncidentSession:
+        """复刻真实跳转：短链 302 → 分享页 200；g=100 地址 302 → 登录页。"""
+
+        def __init__(self, entry_html: bytes = b""):
+            self.calls = []
+            self._entry_html = entry_html
+
+        def get(self, url, params=None, headers=None, **kw):
+            self.calls.append(url)
+            if "g=1336" in url:
+                if self._entry_html:
+                    return IncidentResp(200, self._entry_html)
+                return IncidentResp(302, b"", share_path_page)
+            if url.startswith("https://h5.qzone.qq.com/ugc/share"):
+                return IncidentResp(200, incident_html.encode("utf-8"))
+            if "g=100" in url or "mood/" in url:
+                return IncidentResp(
+                    302, b"", "https://i.qq.com/?s_url=http%3A%2F%2Fuser.qzone.qq.com%2F10001"
+                )
+            return IncidentResp(404, b"")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    creds_i = api.QzoneCredentials(uin=10001, skey="SK", p_skey="PK")
+    sess_i = IncidentSession()
+    with_session = asyncio.run(api.fetch_trusted(sess_i, entry_url, creds=creds_i))
+    check(
+        "跳转终点确实是分享页（复刻真实跳转链）",
+        with_session[0] == share_path_page and with_session[1] == 200,
+        f"{with_session[0]} / {with_session[1]}",
+    )
+    check(
+        "该分享页没有 res_uin / cellid（旧代码正是在这里被误导）",
+        api._has_feed_locator(api.parse_share_url(share_path_page)) is False,
+    )
+    check(
+        "分享页 HTML 里确实内嵌着那条带定位参数的 g=100 地址（红测的证伪力来源）",
+        real_mobile_cell in incident_html,
+    )
+
+    resolved_final, _p_final = asyncio.run(
+        api._resolve_share(IncidentSession(), creds_i, entry_url)
+    )
+    check(
+        "跳转终点是分享页时直接采用它，不再被页面里的 g=100 覆盖",
+        resolved_final == share_path_page,
+        repr(resolved_final),
+    )
+
+    # fetch_post 端到端：必须读到完整正文与全部配图，而不是降级成卡片文字
+    saved_session = api.aiohttp.ClientSession
+    api.aiohttp.ClientSession = lambda **kw: IncidentSession()
+    try:
+        post_i = asyncio.run(api.fetch_post(creds_i, entry_url))
+    finally:
+        api.aiohttp.ClientSession = saved_session
+    check("事故形状下能读到说说", post_i is not None)
+    check(
+        "读到的是完整正文（不是卡片截断摘要）",
+        post_i is not None
+        and post_i.text == "这是说说全文正文，卡片 desc 里只有开头那几十个字",
+        repr(post_i.text if post_i else None),
+    )
+    check(
+        "配图四张全部读到（图片不会是空的）",
+        post_i is not None and len(post_i.images) == 4,
+        str(len(post_i.images) if post_i else -1),
+    )
+    check(
+        "作者/时间被解析（说明真的解析了 FrontPage）",
+        post_i is not None and post_i.uin == 10001 and post_i.name == "solitude",
+        f"{post_i.uin if post_i else None}/{post_i.name if post_i else None}",
+    )
+    check(
+        "原始链接指向分享页，不是那条 g=100 中间页",
+        post_i is not None and post_i.url == share_path_page,
+        str(post_i.url if post_i else None),
+    )
+
+    # 从卡片到「交给模型的请求」：图片必须真的进请求，而不是只停在内部变量里
+    class InjectEvent(_Extras):
+        def get_platform_name(self):
+            return "aiocqhttp"
+
+    class InjectReq:
+        def __init__(self):
+            self.extra_user_content_parts = []
+            self.image_urls = []
+
+    plugin_i = make_plugin(main_mod, api, {"max_images": 2, "summarize_mode": "full"})
+    # 让插件拿到一份假登录态，避免 _build_payload 走「没有登录态」分支而完全不联网
+    plugin_i.cookies.put(creds_i)
+    real_prepare = main_mod.image_utils.prepare_images_with_coverage
+
+    async def fake_prepare(session, urls, **kw):
+        # 不联网、也不依赖 Pillow：按真实语义返回原 URL，并遵守预算截断
+        # （真实实现见 core/images.py::prepare_images_with_coverage，budget 计入结果长度）
+        budget = int(kw.get("budget") or len(urls))
+        return list(urls)[:budget], min(len(urls), budget)
+
+    main_mod.image_utils.prepare_images_with_coverage = fake_prepare
+    saved_session = api.aiohttp.ClientSession
+    # _build_payload 会自己开一个 ClientSession；桩必须支持 async with，
+    # 否则会落到「配图处理失败，退回原始地址」分支，图片预算就测不到了
+    api.aiohttp.ClientSession = lambda **kw: IncidentSession()
+    try:
+        payload_text, payload_images = asyncio.run(
+            plugin_i._build_payload(InjectEvent(), entry_url)
+        )
+    finally:
+        main_mod.image_utils.prepare_images_with_coverage = real_prepare
+        api.aiohttp.ClientSession = saved_session
+    check("组装结果带上了 2 张图（受 max_images 约束）", len(payload_images) == 2, str(payload_images))
+    check(
+        "注入文案如实说明配图张数与附带张数",
+        "配图：共 4 张，已附带前 2 张" in payload_text,
+        payload_text[:400],
+    )
+    check(
+        "只剩一张图时不谎称全部附带",
+        "共 4 张，已附带前 4 张" not in payload_text,
+    )
+
+    ev_inject = InjectEvent()
+    plant_pending(main_mod, plugin_i, ev_inject, payload_text, payload_images)
+    req_inject = InjectReq()
+    asyncio.run(plugin_i.inject_qzone_content(ev_inject, req_inject))
+    check(
+        "图片真的进了 req.image_urls（keep 模式）",
+        len(req_inject.image_urls) == 2,
+        str(req_inject.image_urls),
+    )
+    check(
+        "注入的文本 part 里能看到说说正文",
+        any(
+            "这是说说全文正文" in getattr(part, "text", "")
+            for part in req_inject.extra_user_content_parts
+        ),
+    )
+
+    # 200 形态（v1.0.2 的纯文字说说）：页面里内嵌定位地址，扫描分支仍要能用
+    resolved_200, _p_200 = asyncio.run(
+        api._resolve_share(
+            IncidentSession(entry_html=incident_html.encode("utf-8")), creds_i, entry_url
+        )
+    )
+    check(
+        "入口直接返回 200 时仍能从页面里取到定位地址（旧形态不回归）",
+        resolved_200 == real_mobile_cell.replace("http://", "https://", 1),
+        repr(resolved_200),
+    )
+
+    class DeadSession:
+        """入口页取不到任何东西（404）：必须退回入口地址，不抛异常。"""
+
+        def get(self, url, params=None, headers=None, **kw):
+            return IncidentResp(404, b"")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    resolved_dead, _p_dead = asyncio.run(
+        api._resolve_share(DeadSession(), creds_i, entry_url)
+    )
+    check("读取失败时退回入口地址，不抛异常", resolved_dead == entry_url, repr(resolved_dead))
+    check(
+        "退回路径不含 mood 页猜测地址",
+        "mood/" not in resolved_dead and "user.qzone.qq.com" not in resolved_dead,
+    )
+
     print("\n" + "=" * 56)
     print(f"通过 {passed} 项，失败 {len(failed)} 项")
     if failed:
